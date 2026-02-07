@@ -1,9 +1,13 @@
 """
-DAG Builder - Constructs a directed acyclic graph of the TF2 supply chain.
+DAG Builder - Constructs a supply chain tree from live TF2 game data.
 
-Queries the game for industries and towns, classifies them, builds edges
-between compatible industries, discovers complete chains from raw producers
-to towns, and scores them by profitability.
+Queries the game's Lua-side `query_supply_tree` IPC handler which uses
+constructionRep params and backup functions to build a recursive tree
+of all supply chains from towns back to raw materials, including OR/AND
+input logic and multi-output industries.
+
+Also converts the tree into legacy flat chain format for backward
+compatibility with downstream agents (Surveyor, Strategist, Planner).
 
 Usage:
     python dag_builder.py
@@ -17,354 +21,359 @@ Usage:
 """
 
 import math
-import re
 import sys
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 
-# Add parent to path for ipc_client import
+from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from ipc_client import get_ipc
 
 
-# ============================================================================
-# STANDARD RECIPES (Base Game)
-# ============================================================================
-
-STANDARD_RECIPES = {
-    # Raw producers (no inputs)
-    "coal_mine": {"inputs": [], "outputs": ["COAL"]},
-    "iron_ore_mine": {"inputs": [], "outputs": ["IRON_ORE"]},
-    "oil_well": {"inputs": [], "outputs": ["CRUDE_OIL"]},
-    "forest": {"inputs": [], "outputs": ["LOGS"]},
-    "farm": {"inputs": [], "outputs": ["GRAIN"]},
-    "quarry": {"inputs": [], "outputs": ["STONE"]},
-
-    # Processors
-    "steel_mill": {"inputs": ["IRON_ORE", "COAL"], "outputs": ["STEEL"],
-                   "input_rule": "all"},
-    "oil_refinery": {"inputs": ["CRUDE_OIL"], "outputs": ["OIL"]},
-    "saw_mill": {"inputs": ["LOGS"], "outputs": ["PLANKS"]},
-    "food_processing_plant": {"inputs": ["GRAIN"], "outputs": ["FOOD"]},
-    "construction_material": {"inputs": ["STONE"],
-                              "outputs": ["CONSTRUCTION_MATERIALS"]},
-    "chemical_plant": {"inputs": ["OIL"], "outputs": ["PLASTIC"]},
-    "fuel_refinery": {"inputs": ["OIL"], "outputs": ["FUEL"]},
-    "goods_factory": {"inputs": ["STEEL", "PLASTIC"], "outputs": ["GOODS"],
-                      "input_rule": "all"},
-    "machines_factory": {"inputs": ["PLANKS", "STEEL"], "outputs": ["MACHINES"],
-                         "input_rule": "all"},
-    "tools_factory": {"inputs": ["PLANKS", "STEEL"], "outputs": ["TOOLS"],
-                      "input_rule": "all"},
-}
-
-# Cargos that towns can demand
+# Cargos that towns can demand (kept for backward compat with surveyor import)
 TOWN_DEMANDABLE = {"FOOD", "GOODS", "FUEL", "TOOLS",
                    "CONSTRUCTION_MATERIALS", "MACHINES"}
 
+CARGO_VALUE = {
+    'FOOD': 1.0, 'CONSTRUCTION_MATERIALS': 1.0,
+    'TOOLS': 1.2, 'FUEL': 1.1,
+    'GOODS': 1.5, 'MACHINES': 1.5,
+}
 
-# ============================================================================
-# EXPANDED MOD RECIPE PARSING
-# ============================================================================
-
-# Path to expanded industry mod .con files (adjust for your system)
-EXPANDED_MOD_DIR = Path.home() / (
-    "Library/Application Support/Steam/steamapps/workshop/"
-    "content/1066780/1950013035/res/construction/industry"
-)
-
-
-def parse_con_file(filepath: Path) -> Optional[Dict]:
-    """Parse a .con file to extract industry recipe."""
-    try:
-        content = filepath.read_text()
-    except Exception:
-        return None
-
-    # Extract stocks (input cargo types)
-    stocks = re.findall(r'cargoType\s*=\s*"(\w+)"', content)
-
-    # Extract rule outputs
-    outputs = re.findall(
-        r'output\s*=\s*\{[^}]*cargoType\s*=\s*"(\w+)"', content
-    )
-
-    # Extract rule input combinations
-    input_match = re.search(r'input\s*=\s*\{([^}]+)\}', content)
-    combos = []
-    if input_match and stocks:
-        for combo_match in re.finditer(r'\{([^}]+)\}', input_match.group(1)):
-            try:
-                flags = [int(x.strip()) for x in combo_match.group(1).split(',')]
-                combo = [stocks[i] for i, flag in enumerate(flags) if flag == 1]
-                if combo:
-                    combos.append(combo)
-            except (ValueError, IndexError):
-                pass
-
-    if not outputs:
-        return None
-
-    return {
-        "inputs": stocks if combos else [],
-        "outputs": outputs,
-        "input_combos": combos or ([stocks] if stocks else []),
-        "category": "raw" if not combos and not stocks else "processor"
-    }
-
-
-def load_expanded_mod_recipes() -> Dict[str, Dict]:
-    """Load recipes from expanded industry mod .con files."""
-    recipes = {}
-    if not EXPANDED_MOD_DIR.exists():
-        return recipes
-
-    for con_file in EXPANDED_MOD_DIR.glob("*.con"):
-        recipe = parse_con_file(con_file)
-        if recipe:
-            # Use stem as type key (e.g., "advanced_goods_factory")
-            recipes[con_file.stem] = recipe
-
-    return recipes
-
-
-def load_all_recipes() -> Dict[str, Dict]:
-    """Merge standard + expanded mod recipes."""
-    all_recipes = dict(STANDARD_RECIPES)
-    mod_recipes = load_expanded_mod_recipes()
-    for rtype, recipe in mod_recipes.items():
-        all_recipes[rtype] = recipe  # Mod overrides standard
-    return all_recipes
-
-
-# ============================================================================
-# DAG BUILDER
-# ============================================================================
 
 class DAGBuilder:
     def __init__(self):
         self.ipc = get_ipc()
-        self.recipes = load_all_recipes()
 
     def build(self) -> Dict:
-        """Build the complete supply chain DAG."""
-        # 1. Query game state
-        game_state = self.ipc.send('query_game_state')
-        industries_resp = self.ipc.send('query_industries')
-        demands_resp = self.ipc.send('query_town_demands')
+        """Build the complete supply chain DAG from live game data.
 
-        if not industries_resp or not demands_resp:
-            return {"error": "Could not query game state"}
+        Returns a dict with both the raw supply tree AND legacy flat
+        chain format for backward compatibility.
+        """
+        # 1. Get game state
+        game_state_resp = self.ipc.send('query_game_state')
+        game_state = game_state_resp.get('data', {}) if game_state_resp else {}
 
-        industries = industries_resp.get('data', {}).get('industries', [])
-        towns_data = demands_resp.get('data', {}).get('towns', [])
+        # 2. Query the supply tree from the game (Lua-side builder)
+        tree_resp = self.ipc.send('query_supply_tree')
+        if not tree_resp or tree_resp.get('status') != 'ok':
+            error_msg = "Could not query supply tree"
+            if tree_resp:
+                error_msg += f": {tree_resp.get('message', 'unknown error')}"
+            return {"error": error_msg}
 
-        # 2. Parse town demands
-        town_demands = {}
-        for t in towns_data:
-            demands = {}
-            for demand_str in t.get('cargo_demands', '').split(', '):
-                if ':' in demand_str:
-                    cargo, amount = demand_str.split(':')
-                    demands[cargo.strip()] = int(amount.strip())
-            if demands:
-                town_demands[t['id']] = {
-                    'name': t.get('name', ''),
-                    'x': float(t.get('x', 0)),
-                    'y': float(t.get('y', 0)),
-                    'demands': demands
-                }
+        tree = tree_resp.get('data', {})
+        towns_data = tree.get('towns', [])
 
-        # 3. Classify industries
-        raw_producers = []
-        processors = []
-        unknown = []
-        for ind in industries:
-            classified = self._classify(ind)
-            if classified['category'] == 'raw':
-                raw_producers.append(classified)
-            elif classified['category'] == 'processor':
-                processors.append(classified)
-            else:
-                unknown.append(classified)
-
-        # 4. Build edges
-        edges = self._build_edges(raw_producers, processors, town_demands)
-
-        # 5. Discover complete chains
-        chains = self._discover_chains(
-            raw_producers, processors, edges, town_demands
-        )
+        # 3. Parse tree into legacy formats
+        town_demands = self._extract_town_demands(towns_data)
+        raw_producers, processors = self._extract_industries(towns_data)
+        edges = self._extract_edges(towns_data, town_demands)
+        chains = self._extract_chains(towns_data, town_demands)
 
         return {
-            'game_state': game_state.get('data', {}) if game_state else {},
-            'recipes_loaded': len(self.recipes),
+            'game_state': game_state,
+            'supply_tree': tree,  # New: raw tree data
             'raw_producers': raw_producers,
             'processors': processors,
-            'unknown_types': unknown,
+            'unknown_types': [],
             'town_demands': town_demands,
             'edges': edges,
             'complete_chains': chains,
         }
 
-    def _classify(self, industry: Dict) -> Dict:
-        """Classify an industry using recipe database."""
-        ind_type = industry.get('type', '')
+    # ------------------------------------------------------------------
+    # Legacy format extraction from tree
+    # ------------------------------------------------------------------
 
-        # Try exact match
-        recipe = self.recipes.get(ind_type)
+    def _extract_town_demands(self, towns: List[Dict]) -> Dict:
+        """Convert tree towns to legacy town_demands format."""
+        result = {}
+        for town in towns:
+            demands = {}
+            for cargo, amount in town.get('demands', {}).items():
+                demands[cargo] = int(amount)
+            if demands:
+                result[town['id']] = {
+                    'name': town.get('name', ''),
+                    'x': float(town.get('x', 0)),
+                    'y': float(town.get('y', 0)),
+                    'demands': demands,
+                }
+        return result
 
-        # Try partial match (industry type often has prefix/suffix)
-        if not recipe:
-            for rtype, r in self.recipes.items():
-                if rtype in ind_type or ind_type in rtype:
-                    recipe = r
-                    break
+    def _extract_industries(self, towns: List[Dict]):
+        """Extract unique raw producers and processors from tree nodes."""
+        seen_ids = set()
+        raw_producers = []
+        processors = []
 
-        if not recipe:
-            return {**industry, 'category': 'unknown', 'inputs': [],
-                    'outputs': [], 'input_combos': []}
+        def walk_node(node):
+            pid = node.get('producer_id', '')
+            if pid in seen_ids:
+                return
+            seen_ids.add(pid)
 
-        category = 'raw' if not recipe.get('inputs') else 'processor'
-        return {
-            **industry,
-            'category': category,
-            'inputs': recipe.get('inputs', []),
-            'outputs': recipe.get('outputs', []),
-            'input_combos': recipe.get('input_combos', [recipe.get('inputs', [])]),
-        }
+            info = {
+                'id': pid,
+                'name': node.get('producer_name', ''),
+                'type': node.get('producer_type', ''),
+                'x': node.get('x', '0'),
+                'y': node.get('y', '0'),
+                'outputs': node.get('outputs', []),
+                'production_amount': node.get('production_amount', '0'),
+            }
 
-    def _build_edges(self, raw_producers, processors, town_demands) -> List[Dict]:
-        """Build directed edges between compatible industries."""
+            if node.get('is_raw') == 'true':
+                info['category'] = 'raw'
+                info['inputs'] = []
+                raw_producers.append(info)
+            else:
+                info['category'] = 'processor'
+                # Collect input cargos from input_groups
+                inputs = []
+                for group in node.get('input_groups', []):
+                    if group.get('type') == 'or':
+                        inputs.extend(group.get('alternatives', []))
+                    elif group.get('type') == 'and':
+                        cargo = group.get('cargo', '')
+                        if cargo:
+                            inputs.append(cargo)
+                info['inputs'] = inputs
+                processors.append(info)
+
+            # Recurse into suppliers
+            for group in node.get('input_groups', []):
+                if group.get('type') == 'or':
+                    suppliers_map = group.get('suppliers', {})
+                    for cargo_key, suppliers in suppliers_map.items():
+                        if isinstance(suppliers, list):
+                            for s in suppliers:
+                                walk_node(s)
+                elif group.get('type') == 'and':
+                    for s in group.get('suppliers', []):
+                        walk_node(s)
+
+        for town in towns:
+            for cargo, trees in town.get('supply_trees', {}).items():
+                for tree_node in trees:
+                    walk_node(tree_node)
+
+        return raw_producers, processors
+
+    def _extract_edges(self, towns: List[Dict], town_demands: Dict) -> List[Dict]:
+        """Extract edges from tree, producing legacy edge format."""
         edges = []
+        seen_edges = set()
 
-        # Raw -> Processor
-        for raw in raw_producers:
-            for cargo in raw['outputs']:
-                for proc in processors:
-                    if cargo in proc['inputs']:
-                        dist = self._distance(raw, proc)
-                        if 500 <= dist <= 10000:
-                            edges.append({
-                                'source_id': raw['id'],
-                                'source_name': raw.get('name', ''),
-                                'target_id': proc['id'],
-                                'target_name': proc.get('name', ''),
-                                'cargo': cargo,
-                                'distance': round(dist),
-                                'type': 'raw_to_processor'
-                            })
+        def walk_edges(node, target_id, target_name, target_x, target_y,
+                       edge_type, cargo_delivered=None):
+            pid = node.get('producer_id', '')
+            px = float(node.get('x', 0))
+            py = float(node.get('y', 0))
+            tx = float(target_x)
+            ty = float(target_y)
+            dist = self._distance_xy(px, py, tx, ty)
 
-        # Processor -> Processor (intermediate goods only)
-        for p1 in processors:
-            for cargo in p1['outputs']:
-                if cargo in TOWN_DEMANDABLE:
-                    continue
-                for p2 in processors:
-                    if cargo in p2['inputs'] and p1['id'] != p2['id']:
-                        dist = self._distance(p1, p2)
-                        if 500 <= dist <= 10000:
-                            edges.append({
-                                'source_id': p1['id'],
-                                'source_name': p1.get('name', ''),
-                                'target_id': p2['id'],
-                                'target_name': p2.get('name', ''),
-                                'cargo': cargo,
-                                'distance': round(dist),
-                                'type': 'processor_to_processor'
-                            })
+            # If cargo_delivered is specified, this is the edge cargo
+            if cargo_delivered:
+                edge_key = (pid, target_id, cargo_delivered)
+                if edge_key not in seen_edges:
+                    seen_edges.add(edge_key)
+                    edge = {
+                        'source_id': pid,
+                        'source_name': node.get('producer_name', ''),
+                        'target_id': target_id,
+                        'target_name': target_name,
+                        'cargo': cargo_delivered,
+                        'distance': round(dist),
+                        'type': edge_type,
+                    }
+                    if edge_type == 'processor_to_town':
+                        td = town_demands.get(target_id, {})
+                        edge['town_demand'] = td.get('demands', {}).get(
+                            cargo_delivered, 0)
+                    edges.append(edge)
 
-        # Processor -> Town (final goods, verified demand)
-        for proc in processors:
-            for cargo in proc['outputs']:
-                if cargo not in TOWN_DEMANDABLE:
-                    continue
-                for tid, tinfo in town_demands.items():
-                    if cargo in tinfo['demands']:
-                        dist = self._distance(
-                            proc,
-                            {'x': tinfo['x'], 'y': tinfo['y']}
-                        )
-                        if dist <= 8000:
-                            edges.append({
-                                'source_id': proc['id'],
-                                'source_name': proc.get('name', ''),
-                                'target_id': tid,
-                                'target_name': tinfo['name'],
-                                'cargo': cargo,
-                                'distance': round(dist),
-                                'type': 'processor_to_town',
-                                'town_demand': tinfo['demands'][cargo]
-                            })
+            # Recurse into suppliers
+            for group in node.get('input_groups', []):
+                if group.get('type') == 'or':
+                    suppliers_map = group.get('suppliers', {})
+                    for cargo_key, suppliers in suppliers_map.items():
+                        if isinstance(suppliers, list):
+                            for s in suppliers:
+                                s_type = ('raw_to_processor'
+                                          if s.get('is_raw') == 'true'
+                                          else 'processor_to_processor')
+                                walk_edges(s, pid, node.get('producer_name', ''),
+                                           px, py, s_type, cargo_key)
+                elif group.get('type') == 'and':
+                    cargo = group.get('cargo', '')
+                    for s in group.get('suppliers', []):
+                        s_type = ('raw_to_processor'
+                                  if s.get('is_raw') == 'true'
+                                  else 'processor_to_processor')
+                        walk_edges(s, pid, node.get('producer_name', ''),
+                                   px, py, s_type, cargo)
+
+        for town in towns:
+            tid = town['id']
+            tname = town.get('name', '')
+            tx = town.get('x', '0')
+            ty = town.get('y', '0')
+            for cargo, trees in town.get('supply_trees', {}).items():
+                for tree_node in trees:
+                    walk_edges(tree_node, tid, tname, tx, ty,
+                               'processor_to_town', cargo)
 
         edges.sort(key=lambda e: e['distance'])
         return edges
 
-    def _discover_chains(self, raw_producers, processors, edges,
-                          town_demands) -> List[Dict]:
-        """Discover complete supply chains from raw to town."""
+    def _extract_chains(self, towns: List[Dict],
+                        town_demands: Dict) -> List[Dict]:
+        """Convert tree nodes into legacy flat chain format.
+
+        Each tree node that produces a town-demanded cargo becomes a chain.
+        We flatten the tree into legs (edges) for backward compat.
+        """
         chains = []
 
-        # Find all delivery edges (processor -> town)
-        delivery_edges = [e for e in edges if e['type'] == 'processor_to_town']
+        for town in towns:
+            tid = town['id']
+            tname = town.get('name', '')
+            tx = float(town.get('x', 0))
+            ty = float(town.get('y', 0))
 
-        for delivery in delivery_edges:
-            proc_id = delivery['source_id']
-            proc = next((p for p in processors if str(p['id']) == str(proc_id)), None)
-            if not proc:
-                continue
+            for cargo, trees in town.get('supply_trees', {}).items():
+                demand_amount = int(town.get('demands', {}).get(cargo, 0))
 
-            # Trace backward from processor
-            chain = {
-                'final_cargo': delivery['cargo'],
-                'town': delivery['target_name'],
-                'town_id': delivery['target_id'],
-                'town_demand': delivery.get('town_demand', 0),
-                'processor': proc.get('name', ''),
-                'processor_id': proc_id,
-                'delivery_distance': delivery['distance'],
-                'legs': [delivery],
-                'missing_inputs': [],
-                'feasible': True,
-                'total_distance': delivery['distance'],
-            }
+                for tree_node in trees:
+                    pid = tree_node.get('producer_id', '')
+                    pname = tree_node.get('producer_name', '')
+                    px = float(tree_node.get('x', 0))
+                    py = float(tree_node.get('y', 0))
+                    delivery_dist = round(self._distance_xy(px, py, tx, ty))
 
-            # Find supply legs for each required input
-            for cargo_input in proc['inputs']:
-                supply = self._find_supply(
-                    cargo_input, proc_id, raw_producers, processors, edges
-                )
-                if supply:
-                    chain['legs'].extend(supply['legs'])
-                    chain['total_distance'] += supply['distance']
-                else:
-                    chain['missing_inputs'].append(cargo_input)
-                    chain['feasible'] = False
+                    # Flatten tree into legs
+                    legs = []
+                    missing_inputs = []
+                    total_distance = delivery_dist
 
-            chain['score'] = self._score_chain(chain)
-            chains.append(chain)
+                    # Delivery leg (processor -> town)
+                    delivery_leg = {
+                        'source_id': pid,
+                        'source_name': pname,
+                        'target_id': tid,
+                        'target_name': tname,
+                        'cargo': cargo,
+                        'distance': delivery_dist,
+                        'type': 'processor_to_town',
+                        'town_demand': demand_amount,
+                    }
+                    legs.append(delivery_leg)
+
+                    # Flatten feeder legs recursively
+                    self._flatten_feeders(
+                        tree_node, legs, missing_inputs)
+                    total_distance += sum(
+                        l['distance'] for l in legs[1:])
+
+                    feasible = len(missing_inputs) == 0
+
+                    # Collect all industry IDs
+                    industry_ids = set()
+                    for leg in legs:
+                        industry_ids.add(str(leg['source_id']))
+                        if leg['type'] != 'processor_to_town':
+                            industry_ids.add(str(leg['target_id']))
+
+                    chain = {
+                        'final_cargo': cargo,
+                        'town': tname,
+                        'town_id': tid,
+                        'town_demand': demand_amount,
+                        'processor': pname,
+                        'processor_id': pid,
+                        'delivery_distance': delivery_dist,
+                        'legs': legs,
+                        'missing_inputs': missing_inputs,
+                        'feasible': feasible,
+                        'total_distance': total_distance,
+                        'industry_ids': list(industry_ids),
+                        # New fields from tree
+                        'input_groups': tree_node.get('input_groups', []),
+                    }
+                    chain['score'] = self._score_chain(chain)
+                    chains.append(chain)
 
         chains.sort(key=lambda c: c['score'], reverse=True)
         return chains
 
-    def _find_supply(self, cargo: str, target_id, raw_producers,
-                      processors, edges) -> Optional[Dict]:
-        """Find a supply edge for a cargo to a target industry."""
-        # Look for direct supply (raw -> target or processor -> target)
-        candidates = [
-            e for e in edges
-            if e['cargo'] == cargo and str(e['target_id']) == str(target_id)
-        ]
-        if candidates:
-            best = min(candidates, key=lambda e: e['distance'])
-            return {'legs': [best], 'distance': best['distance']}
+    def _flatten_feeders(self, node: Dict, legs: List[Dict],
+                         missing: List[str]):
+        """Recursively flatten a tree node's input groups into edge legs."""
+        for group in node.get('input_groups', []):
+            if group.get('type') == 'or':
+                # For OR groups, pick the closest available supplier
+                alternatives = group.get('alternatives', [])
+                suppliers_map = group.get('suppliers', {})
+                best_supplier = None
+                best_cargo = None
+                best_dist = float('inf')
 
-        # Look for indirect (raw -> intermediate_processor -> target)
-        for e in edges:
-            if e['cargo'] == cargo:
-                return {'legs': [e], 'distance': e['distance']}
+                for alt_cargo in alternatives:
+                    alt_suppliers = suppliers_map.get(alt_cargo, [])
+                    if isinstance(alt_suppliers, list):
+                        for s in alt_suppliers:
+                            d = int(s.get('distance', 99999))
+                            if d < best_dist:
+                                best_dist = d
+                                best_supplier = s
+                                best_cargo = alt_cargo
 
-        return None
+                if best_supplier and best_cargo:
+                    edge_type = ('raw_to_processor'
+                                 if best_supplier.get('is_raw') == 'true'
+                                 else 'processor_to_processor')
+                    legs.append({
+                        'source_id': best_supplier.get('producer_id', ''),
+                        'source_name': best_supplier.get('producer_name', ''),
+                        'target_id': node.get('producer_id', ''),
+                        'target_name': node.get('producer_name', ''),
+                        'cargo': best_cargo,
+                        'distance': best_dist,
+                        'type': edge_type,
+                    })
+                    self._flatten_feeders(best_supplier, legs, missing)
+                else:
+                    missing.append('|'.join(alternatives))
+
+            elif group.get('type') == 'and':
+                cargo = group.get('cargo', '')
+                suppliers = group.get('suppliers', [])
+                if suppliers:
+                    # Pick closest supplier
+                    best = min(suppliers,
+                               key=lambda s: int(s.get('distance', 99999)))
+                    edge_type = ('raw_to_processor'
+                                 if best.get('is_raw') == 'true'
+                                 else 'processor_to_processor')
+                    legs.append({
+                        'source_id': best.get('producer_id', ''),
+                        'source_name': best.get('producer_name', ''),
+                        'target_id': node.get('producer_id', ''),
+                        'target_name': node.get('producer_name', ''),
+                        'cargo': cargo,
+                        'distance': int(best.get('distance', 0)),
+                        'type': edge_type,
+                    })
+                    self._flatten_feeders(best, legs, missing)
+                else:
+                    missing.append(cargo)
+
+    # ------------------------------------------------------------------
+    # Scoring
+    # ------------------------------------------------------------------
 
     def _score_chain(self, chain: Dict) -> float:
         """Score a chain by profitability potential."""
@@ -383,17 +392,74 @@ class DAGBuilder:
             score += 5
 
         score -= len(chain['legs']) * 5
-
         score -= len(chain['missing_inputs']) * 50
-
-        CARGO_VALUE = {
-            'FOOD': 1.0, 'CONSTRUCTION_MATERIALS': 1.0,
-            'TOOLS': 1.2, 'FUEL': 1.1,
-            'GOODS': 1.5, 'MACHINES': 1.5
-        }
         score *= CARGO_VALUE.get(chain['final_cargo'], 1.0)
 
         return round(score, 1)
+
+    # ------------------------------------------------------------------
+    # Tree formatting for LLM / CLI
+    # ------------------------------------------------------------------
+
+    def format_for_llm(self, tree_data: Dict) -> str:
+        """Format the supply tree as readable text for Claude LLM."""
+        lines = []
+        for town in tree_data.get('towns', []):
+            demands_str = ', '.join(
+                f"{c}:{a}" for c, a in town.get('demands', {}).items())
+            lines.append(f"=== {town['name']} ({demands_str}) ===")
+
+            for cargo, trees in town.get('supply_trees', {}).items():
+                lines.append(f"  {cargo}:")
+                for node in trees:
+                    self._format_node(node, lines, indent=4, is_root=True)
+            lines.append("")
+
+        return '\n'.join(lines)
+
+    def _format_node(self, node: Dict, lines: List[str], indent: int,
+                     is_root: bool = False):
+        """Recursively format a tree node."""
+        prefix = ' ' * indent
+        name = node.get('producer_name', 'Unknown')
+        ptype = node.get('producer_type', '')
+        dist_label = node.get('distance_to_town', node.get('distance', '?'))
+        raw_tag = ' [RAW]' if node.get('is_raw') == 'true' else ''
+
+        if is_root:
+            lines.append(f"{prefix}{name} ({ptype}, {dist_label}m to town)"
+                         f"{raw_tag}")
+        else:
+            lines.append(f"{prefix}{name} ({ptype}, {dist_label}m)"
+                         f"{raw_tag}")
+
+        for group in node.get('input_groups', []):
+            if group.get('type') == 'or':
+                alts = group.get('alternatives', [])
+                lines.append(f"{prefix}  {'|'.join(alts)} [OR]:")
+                suppliers_map = group.get('suppliers', {})
+                for alt_cargo in alts:
+                    suppliers = suppliers_map.get(alt_cargo, [])
+                    if isinstance(suppliers, list) and suppliers:
+                        lines.append(f"{prefix}    {alt_cargo}:")
+                        for s in suppliers:
+                            self._format_node(s, lines, indent + 6)
+                    else:
+                        lines.append(f"{prefix}    {alt_cargo}: [NO SUPPLIER]")
+            elif group.get('type') == 'and':
+                cargo = group.get('cargo', '?')
+                sc = group.get('sources_count', '1')
+                suppliers = group.get('suppliers', [])
+                if suppliers:
+                    lines.append(f"{prefix}  {cargo} [AND, need {sc}]:")
+                    for s in suppliers:
+                        self._format_node(s, lines, indent + 4)
+                else:
+                    lines.append(f"{prefix}  {cargo} [AND]: [NO SUPPLIER]")
+
+    # ------------------------------------------------------------------
+    # Utilities
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _distance(a: Dict, b: Dict) -> float:
@@ -402,17 +468,20 @@ class DAGBuilder:
         bx, by = float(b.get('x', 0)), float(b.get('y', 0))
         return math.sqrt((ax - bx) ** 2 + (ay - by) ** 2)
 
+    @staticmethod
+    def _distance_xy(x1: float, y1: float, x2: float, y2: float) -> float:
+        """Euclidean distance between two points."""
+        return math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
+
 
 # ============================================================================
 # CLI
 # ============================================================================
 
 def main():
-    print("=== TF2 Supply Chain DAG Builder ===\n")
+    print("=== TF2 Supply Chain DAG Builder (Dynamic) ===\n")
 
     builder = DAGBuilder()
-    print(f"Recipes loaded: {len(builder.recipes)}")
-
     dag = builder.build()
 
     if 'error' in dag:
@@ -423,20 +492,32 @@ def main():
     print(f"Game: Year {gs.get('year')}, ${int(gs.get('money', 0)):,}")
     print(f"Raw producers: {len(dag['raw_producers'])}")
     print(f"Processors: {len(dag['processors'])}")
-    print(f"Unknown: {len(dag['unknown_types'])}")
     print(f"Edges: {len(dag['edges'])}")
     print(f"Town demands: {len(dag['town_demands'])}")
 
-    print(f"\n=== Top Chains (by score) ===")
+    # Print tree view
+    tree = dag.get('supply_tree', {})
+    if tree:
+        print(f"\n=== Supply Chain Trees ===")
+        print(builder.format_for_llm(tree))
+
+    # Print legacy chain view
+    print(f"=== Top Chains (by score) ===")
     for i, chain in enumerate(dag['complete_chains'][:10]):
-        status = "OK" if chain['feasible'] else f"MISSING: {chain['missing_inputs']}"
+        status = ("OK" if chain['feasible']
+                  else f"MISSING: {chain['missing_inputs']}")
+        n_legs = len(chain['legs'])
         print(f"  {i+1}. [{chain['score']}] {chain['final_cargo']} -> "
               f"{chain['town']} (demand={chain['town_demand']}, "
-              f"dist={chain['total_distance']}m) [{status}]")
+              f"dist={chain['total_distance']}m, {n_legs} legs) [{status}]")
+        for leg in chain['legs']:
+            print(f"       {leg['source_name']} -> {leg['target_name']} "
+                  f"({leg['cargo']}, {leg['type']}, {leg['distance']}m)")
 
     print(f"\n=== Town Demands ===")
     for tid, tinfo in dag['town_demands'].items():
-        demands_str = ', '.join(f"{c}:{a}" for c, a in tinfo['demands'].items())
+        demands_str = ', '.join(
+            f"{c}:{a}" for c, a in tinfo['demands'].items())
         print(f"  {tinfo['name']}: {demands_str}")
 
 

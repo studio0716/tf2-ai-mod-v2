@@ -6,9 +6,11 @@ Build an autonomous multi-agent AI system that plays **Transport Fever 2** (TF2)
 
 1. **Mod the game** via a Lua IPC layer that exposes game state and accepts build commands
 2. **Model the game world** as a directed acyclic graph (DAG) of industries, processors, towns, and transport routes
-3. **Plan and execute** supply chain construction using multi-agent coordination
-4. **Learn from outcomes** to improve strategy over time
-5. **Dominate** — achieve maximum town growth, transport coverage, and profit
+3. **Measure performance** via a metrics system that tracks money rate, line health, delivery trends, and chain health over time
+4. **Plan and execute** supply chain construction using multi-agent coordination
+5. **Reason about strategy** using LLM-powered decision-making that considers metrics, past outcomes, and economic constraints
+6. **Learn from outcomes** to improve strategy over time
+7. **Dominate** — achieve maximum town growth, transport coverage, and profit
 
 ## Game Overview
 
@@ -19,46 +21,41 @@ Transport Fever 2 is a real-time transportation simulation where the player buil
 ## System Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    ORCHESTRATOR (Supervisor LLM)                │
-│  - Queries game state via IPC                                   │
-│  - Spawns specialized agents for analysis/planning/execution    │
-│  - Maintains game state DAG model                               │
-│  - Stores/retrieves memory for learning                         │
-│  - Loops: Observe → Plan → Execute → Verify → Learn            │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-          ┌─────────────────┼─────────────────┐
-          │                 │                 │
-   ┌──────▼──────┐  ┌──────▼──────┐  ┌──────▼──────┐
-   │  STRATEGIST  │  │   BUILDER   │  │  VERIFIER   │
-   │  - DAG model │  │  - IPC cmds │  │  - Diff chk │
-   │  - Chain plan│  │  - Scaling  │  │  - Log parse│
-   │  - Scoring   │  │  - Vehicles │  │  - Learning │
-   └──────────────┘  └──────┬──────┘  └─────────────┘
-                            │
-                ┌───────────▼───────────┐
-                │     IPC LAYER (Lua)    │
-                │  /tmp/tf2_cmd.json     │
-                │  /tmp/tf2_resp.json    │
-                └───────────┬───────────┘
-                            │
-                ┌───────────▼───────────┐
-                │   Transport Fever 2    │
-                │   (Game Process)       │
-                └───────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                    ORCHESTRATOR (Supervisor)                      │
+│  Loops: Metrics → Survey → Strategize → Plan → Build → Verify   │
+└──────────┬──────────┬──────────┬──────────┬──────────┬───────────┘
+           │          │          │          │          │
+    ┌──────▼───┐ ┌────▼────┐ ┌──▼────┐ ┌──▼─────┐ ┌──▼──────────┐
+    │ SURVEYOR │ │STRATEGST│ │PLANNER│ │BUILDER │ │DIAGNOSTICIAN│
+    │ -DAG/tree│ │-LLM/heur│ │-steps │ │-IPC cmd│ │-zero-xport  │
+    │ -metrics │ │-scoring │ │-legs  │ │-vehicles│ │-root cause  │
+    │ -health  │ │-memory  │ │-budget│ │-scaling│ │-cargo check │
+    └──────────┘ └─────────┘ └───────┘ └───┬────┘ └─────────────┘
+                                           │
+                              ┌─────────────▼──────────────┐
+                              │       IPC LAYER (Lua)       │
+                              │  /tmp/tf2_cmd.json          │
+                              │  /tmp/tf2_resp.json         │
+                              └─────────────┬──────────────┘
+                                            │
+                              ┌─────────────▼──────────────┐
+                              │     Transport Fever 2       │
+                              │     (Game Process)          │
+                              └────────────────────────────┘
 ```
 
 ## Component PRDs
 
-This master PRD is split into 4 detailed sub-PRDs:
+This master PRD is split into 5 detailed sub-PRDs:
 
 | PRD | File | Scope |
 |-----|------|-------|
-| **01: IPC & Mod Layer** | `01_IPC_MOD_LAYER.md` | Lua mod structure, IPC protocol, all 46 command handlers, file paths, error handling |
+| **01: IPC & Mod Layer** | `01_IPC_MOD_LAYER.md` | Lua mod structure, IPC protocol, all command handlers, file paths, error handling |
 | **02: Game Domain & DAG** | `02_GAME_DOMAIN_DAG.md` | Industry types, cargo classification, supply chain rules, DAG modeling, route scoring |
-| **03: Multi-Agent System** | `03_MULTI_AGENT_SYSTEM.md` | Agent roles, orchestration loop, decision-making, memory/learning |
+| **03: Multi-Agent System** | `03_MULTI_AGENT_SYSTEM.md` | Agent roles (including Diagnostician), orchestration loop, decision-making, memory/learning |
 | **04: Operational Playbook** | `04_OPERATIONAL_PLAYBOOK.md` | Proven build sequences, scaling formulas, frequency targets, gotchas, anti-patterns |
+| **05: Dynamic Supply Tree** | `05_SUPPLY_TREE.md` | `query_supply_tree` IPC handler, OR/AND input groups, recursive tree format, recipe discovery |
 
 ## Key Constraints
 
@@ -66,15 +63,19 @@ This master PRD is split into 4 detailed sub-PRDs:
 - TF2's Lua sandbox: no `os.execute`, no `sleep`, no network — only file I/O via `/tmp/`
 - ALL JSON values must be strings (`"1855"` not `1855`) for Lua's JSON parser
 - Game runs real-time at 1-4x speed; IPC polling is ~100ms
+- Calendar speed (date advancement) is independent from game speed — set to 0.25x so supply chains have time to stabilize before the year advances
 - Async operations (rail track building) require polling for completion
-- Game autosaves periodically; save/load cycle takes ~5s
+- Game autosaves ONLY at year boundaries — with slow calendar speed (0.25x), restarting TF2 mid-year loses ALL built lines/vehicles since last year boundary
+- Python stdout is buffered when piped — use `PYTHONUNBUFFERED=1` to see orchestrator print() output in real time
 
 ### Economic
 - Revenue ONLY comes from delivering final goods to towns that demand them
 - Feeding raw materials to processors does NOT generate net revenue (vehicle costs > transport income)
 - Must complete entire chain to a town or you WILL go bankrupt
-- Budget limit: never spend more than 30% of cash on a single build
+- Budget limit: never spend more than 40% of cash on a single build (was 30%, too restrictive on maps with spread-out industries)
 - Vehicle maintenance is continuous — over-buying trucks kills profit
+- Vehicle costs scale with game year — ~$100K in 1900, $600K+ in 2400s
+- New lines need ~5 minutes for cargo to flow end-to-end before judging performance
 
 ### Strategic
 - Not all towns demand all products — MUST query `query_town_demands` before planning
@@ -87,12 +88,14 @@ This master PRD is split into 4 detailed sub-PRDs:
 
 | Metric | Target |
 |--------|--------|
-| Cash growth | Positive YoY after year 5 |
-| Line profitability | >80% of lines profitable within 3 game years |
+| Cash growth | Positive $/min rate (tracked via metrics system) |
+| Line profitability | >80% of lines healthy (interval < 120s with vehicles) |
 | Town demand fulfillment | >50% of all town demands served |
+| Town supply trending up | Cargo supply increasing at served towns |
 | Vehicle utilization | >70% on all lines |
 | Build success rate | >90% of build commands succeed |
 | Chain completion rate | 100% — no incomplete chains |
+| Chain health | All built chains remain healthy (lines alive, supply arriving) |
 
 ## Technology Stack
 

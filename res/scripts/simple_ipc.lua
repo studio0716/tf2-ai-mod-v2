@@ -319,6 +319,41 @@ handlers.query_town_demands = function(params)
     return {status = "ok", data = {towns = towns}}
 end
 
+-- Query ALL cargo supply/limit/demand for every town (for metrics tracking)
+handlers.query_town_supply = function(params)
+    local towns = {}
+    local allTowns = game.interface.getEntities({radius=1e9}, {type="TOWN", includeData=true})
+
+    for townId, town in pairs(allTowns) do
+        local cargos = {}
+        local ok, cargoSupplyAndLimit = pcall(function()
+            return game.interface.getTownCargoSupplyAndLimit(townId)
+        end)
+
+        if ok and cargoSupplyAndLimit then
+            for cargoName, supplyAndLimit in pairs(cargoSupplyAndLimit) do
+                local supply = supplyAndLimit[1] or 0
+                local limit = supplyAndLimit[2] or 0
+                table.insert(cargos, {
+                    cargo = cargoName,
+                    supply = tostring(supply),
+                    limit = tostring(limit),
+                    demand = tostring(math.max(0, limit - supply))
+                })
+            end
+        end
+
+        table.insert(towns, {
+            id = tostring(townId),
+            name = town.name or "Unknown",
+            cargos = cargos
+        })
+    end
+
+    log("QUERY_TOWN_SUPPLY: found " .. #towns .. " towns")
+    return {status = "ok", data = {towns = towns}}
+end
+
 handlers.query_industries = function(params)
     if not game or not game.interface then
         return {status = "error", message = "Game interface not available"}
@@ -375,6 +410,37 @@ handlers.query_lines = function(params)
             interval = 1 / frequency  -- frequency is vehicles per second
         end
 
+        -- Get items transported using CUMULATIVE totals.
+        -- itemsTransported has: _lastYear (table), _lastMonth (table), _sum (number),
+        -- plus top-level cargo keys like GRAIN=102 (cumulative total per cargo).
+        -- There is NO _thisYear field. Use top-level cargo keys for reliable data.
+        local transported = {}
+        local totalTransported = 0
+        if lineEntity and lineEntity.itemsTransported then
+            -- Top-level keys (not starting with _) are cumulative cargo totals
+            for cargoName, amount in pairs(lineEntity.itemsTransported) do
+                if type(cargoName) == "string" and cargoName:sub(1,1) ~= "_"
+                   and type(amount) == "number" and amount > 0 then
+                    transported[cargoName] = amount
+                    totalTransported = totalTransported + amount
+                end
+            end
+            -- If no top-level cargo keys found, fall back to _lastYear
+            if totalTransported == 0 and lineEntity.itemsTransported._lastYear then
+                for cargoName, amount in pairs(lineEntity.itemsTransported._lastYear) do
+                    if type(cargoName) == "string" and cargoName:sub(1,1) ~= "_"
+                       and type(amount) == "number" and amount > 0 then
+                        transported[cargoName] = amount
+                        totalTransported = totalTransported + amount
+                    end
+                end
+            end
+        end
+        -- Convert to strings for JSON
+        for k, v in pairs(transported) do
+            transported[k] = tostring(math.floor(v))
+        end
+
         table.insert(lines, {
             id = tostring(lineId),
             name = naming and naming.name or ("Line " .. lineId),
@@ -382,11 +448,61 @@ handlers.query_lines = function(params)
             stop_count = tostring(lineData and #lineData.stops or 0),
             rate = tostring(rate),
             frequency = tostring(frequency),
-            interval = tostring(math.floor(interval))  -- seconds between vehicles
+            interval = tostring(math.floor(interval)),  -- seconds between vehicles
+            transported = transported,  -- cargo -> amount last year
+            total_transported = tostring(math.floor(totalTransported))
         })
     end
 
     return {status = "ok", data = {lines = lines}}
+end
+
+-- Debug: dump itemsTransported structure for a line
+handlers.debug_line_transport = function(params)
+    if not params or not params.line_id then
+        return {status = "error", message = "Need line_id parameter"}
+    end
+    local util = require "ai_builder_base_util"
+    local lineId = tonumber(params.line_id)
+    local lineEntity = util.getEntity(lineId)
+    if not lineEntity then
+        return {status = "error", message = "Line entity not found"}
+    end
+
+    local result = {entity_keys = {}, transport_keys = {}, raw_type = "unknown"}
+
+    -- Enumerate entity top-level keys
+    for k, v in pairs(lineEntity) do
+        table.insert(result.entity_keys, tostring(k) .. "=" .. type(v))
+    end
+
+    if lineEntity.itemsTransported then
+        result.raw_type = type(lineEntity.itemsTransported)
+        -- Enumerate all keys in itemsTransported
+        for k, v in pairs(lineEntity.itemsTransported) do
+            table.insert(result.transport_keys, tostring(k) .. "=" .. type(v))
+            if type(v) == "table" then
+                local sub = {}
+                for sk, sv in pairs(v) do
+                    sub[tostring(sk)] = tostring(sv)
+                end
+                result["sub_" .. tostring(k)] = sub
+            elseif type(v) == "userdata" then
+                -- Try tostring on userdata
+                result["val_" .. tostring(k)] = "userdata:" .. tostring(v)
+            else
+                result["val_" .. tostring(k)] = tostring(v)
+            end
+        end
+    else
+        result.raw_type = "nil_or_false"
+        result.has_field = tostring(lineEntity.itemsTransported)
+    end
+
+    result.rate = tostring(lineEntity.rate or 0)
+    result.frequency = tostring(lineEntity.frequency or 0)
+
+    return {status = "ok", data = result}
 end
 
 -- Trigger AI Builder to optimize a line's vehicle count
@@ -681,6 +797,18 @@ handlers.set_speed = function(params)
     log("SET_SPEED: Setting to " .. tostring(speed))
     api.cmd.sendCommand(api.cmd.make.setGameSpeed(speed))
     return {status = "ok", data = {speed = tostring(speed)}}
+end
+
+-- Calendar speed controls date advancement rate (separate from game simulation speed)
+-- Raw integer value: displayed_speed = 2000 / value (at game speed 4x)
+-- Examples: 4=500x (default), 16=125x, 8000=0.25x
+-- 0 pauses the calendar
+handlers.set_calendar_speed = function(params)
+    local speed = math.floor(tonumber(params and params.speed) or 4)
+    if speed < 0 then speed = 0 end
+    log("SET_CALENDAR_SPEED: Setting to " .. tostring(speed))
+    api.cmd.sendCommand(api.cmd.make.setCalendarSpeed(speed))
+    return {status = "ok", data = {calendar_speed = tostring(speed)}}
 end
 
 -- Query terrain height at a position (water is below 0)
@@ -1089,22 +1217,51 @@ handlers.build_cargo_to_town = function(params)
 
     log("BUILD_CARGO_TO_TOWN: " .. industry.name .. " -> " .. town.name)
 
-    -- Create the evaluation parameters with preSelectedPair
-    -- The AI Builder handles TOWN as second entity specially
-    local evalParams = {
-        preSelectedPair = {ind_id, town_id},
-        maxDist = 1e9,  -- Allow any distance (Claude already validated)
-        cargoFilter = params.cargo or nil,  -- Optional cargo filter
-        isTownDelivery = true
+    -- Get positions for both entities
+    local function posToVec3(pos)
+        if not pos then return {x = 0, y = 0, z = 0} end
+        return {
+            x = pos[1] or pos.x or 0,
+            y = pos[2] or pos.y or 0,
+            z = pos[3] or pos.z or 0
+        }
+    end
+
+    local p0 = posToVec3(industry.position)
+    local p1 = posToVec3(town.position)
+
+    log("BUILD_CARGO_TO_TOWN: p0=(" .. tostring(p0.x) .. "," .. tostring(p0.y) .. ") p1=(" .. tostring(p1.x) .. "," .. tostring(p1.y) .. ")")
+
+    -- Add IDs to entities (required by AI builder)
+    industry.id = ind_id
+    town.id = town_id
+
+    local dx = p1.x - p0.x
+    local dy = p1.y - p0.y
+    local distance = math.sqrt(dx * dx + dy * dy)
+
+    -- Build result object same as build_connection does
+    local result = {
+        industry1 = industry,
+        industry2 = town,
+        carrier = api.type.enum.Carrier.ROAD,
+        cargoType = params.cargo or nil,
+        p0 = p0,
+        p1 = p1,
+        distance = distance,
+        isTown = true,
+        needsNewRoute = true,
+        isAutoBuildMode = true,
+        isCargo = true
     }
 
-    -- Send to AI Builder for town delivery build
+    -- Send to AI Builder using the standard road connection builder
     local ok, err = pcall(function()
         api.cmd.sendCommand(api.cmd.make.sendScriptEvent(
             "ai_builder_script",
-            "buildCargoToTown",  -- New event handler needed in ai_builder_script
+            "buildNewIndustryRoadConnection",
             "",
-            evalParams
+            {ignoreErrors = false, result = result, preSelectedPair = {ind_id, town_id}}
         ))
     end)
 
@@ -1313,10 +1470,70 @@ handlers.delete_line = function(params)
     end
 
     local lineId = tonumber(params.line_id)
+
+    -- Sell ALL vehicles first (deleteLine fails if vehicles remain)
+    local vehicles = api.engine.system.transportVehicleSystem.getLineVehicles(lineId)
+    local sold = 0
+    for i = #vehicles, 1, -1 do
+        pcall(function()
+            api.cmd.sendCommand(api.cmd.make.sellVehicle(vehicles[i]))
+        end)
+        sold = sold + 1
+    end
+    if sold > 0 then
+        log("Sold " .. sold .. " vehicles before deleting line " .. tostring(lineId))
+    end
+
     api.cmd.sendCommand(api.cmd.make.deleteLine(lineId))
     log("Deleted line " .. tostring(lineId))
 
-    return {status = "ok", message = "Line deleted", line_id = tostring(lineId)}
+    return {status = "ok", message = "Line deleted", data = {
+        vehicles_sold = tostring(sold),
+        line_id = tostring(lineId)
+    }}
+end
+
+-- Remove N vehicles from a line (sells them)
+handlers.remove_vehicles_from_line = function(params)
+    if not params or not params.line_id then
+        return {status = "error", message = "Need line_id parameter"}
+    end
+    local lineId = tonumber(params.line_id)
+    local count = math.min(tonumber(params.count or "1") or 1, 20)
+    if not lineId then
+        return {status = "error", message = "Invalid line_id"}
+    end
+
+    local vehicles = api.engine.system.transportVehicleSystem.getLineVehicles(lineId)
+    if #vehicles == 0 then
+        return {status = "ok", data = {removed = "0", remaining = "0"}}
+    end
+
+    -- Keep at least 1 vehicle on the line
+    local toRemove = math.min(count, #vehicles - 1)
+    if toRemove <= 0 then
+        return {status = "ok", data = {removed = "0", remaining = tostring(#vehicles)}}
+    end
+
+    local removed = 0
+    for i = 1, toRemove do
+        local vehicleId = vehicles[#vehicles - i + 1]  -- Remove from end
+        local ok, err = pcall(function()
+            api.cmd.sendCommand(api.cmd.make.sellVehicle(vehicleId))
+        end)
+        if ok then
+            removed = removed + 1
+        else
+            log("REMOVE_VEHICLES: Failed to sell vehicle " .. tostring(vehicleId) .. ": " .. tostring(err))
+        end
+    end
+
+    log("REMOVE_VEHICLES: Removed " .. removed .. "/" .. toRemove .. " from line " .. lineId)
+    return {status = "ok", data = {
+        removed = tostring(removed),
+        remaining = tostring(#vehicles - removed),
+        line_id = tostring(lineId)
+    }}
 end
 
 -- Sell a vehicle
@@ -1541,7 +1758,10 @@ handlers.add_vehicle_to_line = function(params)
         log("ADD_VEHICLE: lineName=" .. lineName)
 
         -- Check if line name contains known cargo types
-        local cargoTypes = {"COAL", "IRON_ORE", "STONE", "GRAIN", "CRUDE_OIL", "OIL", "STEEL", "PLANKS", "FOOD", "GOODS", "FUEL", "CONSTRUCTION_MATERIALS", "TOOLS", "MACHINES", "PLASTIC", "LOGS", "LIVESTOCK"}
+        -- Cargo types ordered longest-first to prevent false substring matches
+        -- (e.g. "OIL_SAND" before "OIL", "IRON_ORE" before "IRON")
+        -- Game uses CRUDE (not CRUDE_OIL) for crude oil cargo
+        local cargoTypes = {"CONSTRUCTION_MATERIALS", "COFFEE_BERRIES", "SILVER_ORE", "IRON_ORE", "OIL_SAND", "LIVESTOCK", "MACHINES", "PLASTIC", "PLANKS", "MARBLE", "SILVER", "GRAIN", "CRUDE", "STEEL", "STONE", "PAPER", "GOODS", "TOOLS", "COAL", "FOOD", "FUEL", "FISH", "MEAT", "SAND", "SLAG", "LOGS", "ALCOHOL", "COFFEE"}
         for _, cargo in ipairs(cargoTypes) do
             -- Check for cargo name in line name (case insensitive, also check without underscore)
             local cargoLower = string.lower(cargo)
@@ -3585,6 +3805,455 @@ handlers.build_train_depot = function(params)
 
     if ok then return result end
     return {status = "error", message = "build_train_depot failed: " .. tostring(result)}
+end
+
+-- ============================================================================
+-- SUPPLY CHAIN TREE BUILDER
+-- Builds a recursive tree of all supply chains from towns back to raw materials
+-- Uses constructionRep params (sourcesCountForAiBuilder) + backup functions
+-- ============================================================================
+handlers.query_supply_tree = function(params)
+    log("QUERY_SUPPLY_TREE: building supply chain tree")
+
+    local ok, result = pcall(function()
+        local util = require "ai_builder_base_util"
+
+        -- ====================================================================
+        -- Step 1: Build recipe lookup tables from constructionRep + backups
+        -- ====================================================================
+        local industriesToOutput = {}   -- fileName -> {cargoType, ...}
+        local outputsToIndustries = {}  -- cargoType -> {fileName, ...}
+        local ruleSources = {}          -- fileName -> {cargoType -> sourcesCount}
+        local hasOrCondition = {}       -- fileName -> true if any sourcesCount < 1
+
+        -- Try constructionRep params first (same pattern as discoverIndustryData)
+        local allConstructions = {}
+        local repOk, allReps = pcall(function()
+            return util.deepClone(api.res.constructionRep.getAll())
+        end)
+        if repOk and allReps then
+            for _, fileName in pairs(allReps) do
+                if string.find(fileName, "industry") and not string.find(fileName, "industry/extension/") then
+                    table.insert(allConstructions, fileName)
+                    local findOk, industryRep = pcall(function()
+                        return api.res.constructionRep.get(api.res.constructionRep.find(fileName))
+                    end)
+                    if findOk and industryRep and industryRep.params then
+                        local thisInputCargos = {}
+                        local thisSourcesCounts = {}
+                        local thisOutputCargos = {}
+
+                        for _, param in pairs(industryRep.params) do
+                            if param.key == "inputCargoTypeForAiBuilder" then
+                                for _, cargoType in pairs(param.values) do
+                                    if cargoType == "NONE" then break end
+                                    table.insert(thisInputCargos, cargoType)
+                                end
+                            end
+                            if param.key == "outputCargoTypeForAiBuilder" then
+                                for _, cargoType in pairs(param.values) do
+                                    if cargoType == "NONE" then break end
+                                    table.insert(thisOutputCargos, cargoType)
+                                end
+                            end
+                            if param.key == "sourcesCountForAiBuilder" then
+                                thisSourcesCounts = param.values
+                            end
+                        end
+
+                        -- Store outputs
+                        if #thisOutputCargos > 0 then
+                            industriesToOutput[fileName] = thisOutputCargos
+                        end
+
+                        -- Store rule sources (OR/AND detection)
+                        if #thisInputCargos > 0 then
+                            ruleSources[fileName] = {}
+                            for i, cargo in ipairs(thisInputCargos) do
+                                local sc = tonumber(thisSourcesCounts[i]) or 1
+                                ruleSources[fileName][cargo] = sc
+                                if sc < 1 then
+                                    hasOrCondition[fileName] = true
+                                end
+                            end
+                        else
+                            ruleSources[fileName] = {}
+                        end
+                    end
+                end
+            end
+        end
+
+        -- Backup data for industries not discovered from constructionRep
+        -- (these functions are local in ai_builder_new_connections_evaluation.lua
+        -- and not exported, so we include inline copies here)
+        local backupOutputs
+        do
+            backupOutputs = {}
+            backupOutputs["industry/iron_ore_mine.con"] = {"IRON_ORE"}
+            backupOutputs["industry/coal_mine.con"] = {"COAL"}
+            backupOutputs["industry/forest.con"] = {"LOGS"}
+            backupOutputs["industry/oil_well.con"] = {"CRUDE"}
+            backupOutputs["industry/quarry.con"] = {"STONE"}
+            backupOutputs["industry/farm.con"] = {"GRAIN"}
+            backupOutputs["industry/steel_mill.con"] = {"STEEL"}
+            backupOutputs["industry/saw_mill.con"] = {"PLANKS"}
+            backupOutputs["industry/oil_refinery.con"] = {"FUEL", "PLASTIC"}
+            backupOutputs["industry/chemical_plant.con"] = {"PLASTIC"}
+            backupOutputs["industry/fuel_refinery.con"] = {"FUEL"}
+            backupOutputs["industry/food_processing_plant.con"] = {"FOOD"}
+            backupOutputs["industry/tools_factory.con"] = {"TOOLS"}
+            backupOutputs["industry/machines_factory.con"] = {"MACHINES"}
+            backupOutputs["industry/goods_factory.con"] = {"GOODS"}
+            backupOutputs["industry/construction_material.con"] = {"CONSTRUCTION_MATERIALS"}
+            backupOutputs["industry/advanced_chemical_plant.con"] = {"PLASTIC"}
+            backupOutputs["industry/advanced_construction_material.con"] = {"CONSTRUCTION_MATERIALS"}
+            backupOutputs["industry/advanced_food_processing_plant.con"] = {"FOOD"}
+            backupOutputs["industry/advanced_fuel_refinery.con"] = {"FUEL", "SAND"}
+            backupOutputs["industry/advanced_goods_factory.con"] = {"GOODS"}
+            backupOutputs["industry/advanced_machines_factory.con"] = {"MACHINES"}
+            backupOutputs["industry/advanced_steel_mill.con"] = {"STEEL", "SLAG"}
+            backupOutputs["industry/advanced_tools_factory.con"] = {"TOOLS"}
+            backupOutputs["industry/alcohol_distillery.con"] = {"ALCOHOL"}
+            backupOutputs["industry/coffee_farm.con"] = {"COFFEE_BERRIES"}
+            backupOutputs["industry/coffee_refinery.con"] = {"COFFEE"}
+            backupOutputs["industry/fishery.con"] = {"FISH"}
+            backupOutputs["industry/livestock_farm.con"] = {"LIVESTOCK"}
+            backupOutputs["industry/marble_mine.con"] = {"MARBLE"}
+            backupOutputs["industry/meat_processing_plant.con"] = {"MEAT"}
+            backupOutputs["industry/oil_sand_mine.con"] = {"OIL_SAND"}
+            backupOutputs["industry/paper_mill.con"] = {"PAPER"}
+            backupOutputs["industry/silver_mill.con"] = {"SILVER"}
+            backupOutputs["industry/silver_ore_mine.con"] = {"SILVER_ORE"}
+        end
+
+        local backupRuleSources
+        do
+            backupRuleSources = {}
+            backupRuleSources["industry/iron_ore_mine.con"] = {}
+            backupRuleSources["industry/coal_mine.con"] = {}
+            backupRuleSources["industry/forest.con"] = {}
+            backupRuleSources["industry/oil_well.con"] = {}
+            backupRuleSources["industry/quarry.con"] = {}
+            backupRuleSources["industry/farm.con"] = {}
+            backupRuleSources["industry/steel_mill.con"] = {["IRON_ORE"]=1, ["COAL"]=1}
+            backupRuleSources["industry/saw_mill.con"] = {["LOGS"]=1}
+            backupRuleSources["industry/oil_refinery.con"] = {["CRUDE"]=1}
+            backupRuleSources["industry/chemical_plant.con"] = {["CRUDE"]=1}
+            backupRuleSources["industry/fuel_refinery.con"] = {["CRUDE"]=1}
+            backupRuleSources["industry/food_processing_plant.con"] = {["GRAIN"]=1}
+            backupRuleSources["industry/tools_factory.con"] = {["STEEL"]=1, ["PLANKS"]=1}
+            backupRuleSources["industry/machines_factory.con"] = {["STEEL"]=1, ["PLASTIC"]=1}
+            backupRuleSources["industry/goods_factory.con"] = {["STEEL"]=1, ["PLASTIC"]=1}
+            backupRuleSources["industry/construction_material.con"] = {["STONE"]=1, ["STEEL"]=1}
+            backupRuleSources["industry/advanced_chemical_plant.con"] = {["GRAIN"]=2}
+            backupRuleSources["industry/advanced_construction_material.con"] = {["SLAG"]=1, ["SAND"]=1, ["MARBLE"]=1, ["STONE"]=1}
+            backupRuleSources["industry/advanced_food_processing_plant.con"] = {["MEAT"]=1, ["COFFEE"]=1, ["ALCOHOL"]=1}
+            backupRuleSources["industry/advanced_fuel_refinery.con"] = {["OIL_SAND"]=2}
+            backupRuleSources["industry/advanced_goods_factory.con"] = {["PLASTIC"]=1, ["PLANKS"]=1, ["PAPER"]=1, ["SILVER"]=1}
+            backupRuleSources["industry/advanced_machines_factory.con"] = {["SILVER"]=1, ["STEEL"]=1}
+            backupRuleSources["industry/advanced_steel_mill.con"] = {["IRON_ORE"]=2, ["COAL"]=2}
+            backupRuleSources["industry/advanced_tools_factory.con"] = {["STEEL"]=1}
+            backupRuleSources["industry/alcohol_distillery.con"] = {["GRAIN"]=1}
+            backupRuleSources["industry/coffee_refinery.con"] = {["COFFEE_BERRIES"]=1}
+            backupRuleSources["industry/livestock_farm.con"] = {["GRAIN"]=1}
+            backupRuleSources["industry/meat_processing_plant.con"] = {["LIVESTOCK"]=1, ["FISH"]=1}
+            backupRuleSources["industry/paper_mill.con"] = {["LOGS"]=1}
+            backupRuleSources["industry/silver_mill.con"] = {["SILVER_ORE"]=1}
+            backupRuleSources["industry/coffee_farm.con"] = {}
+            backupRuleSources["industry/fishery.con"] = {}
+            backupRuleSources["industry/marble_mine.con"] = {}
+            backupRuleSources["industry/oil_sand_mine.con"] = {}
+            backupRuleSources["industry/silver_ore_mine.con"] = {}
+        end
+
+        -- Merge backup data for anything not discovered from constructionRep
+        for fileName, outputs in pairs(backupOutputs) do
+            if not industriesToOutput[fileName] or #industriesToOutput[fileName] == 0 then
+                industriesToOutput[fileName] = outputs
+            end
+        end
+        for fileName, sources in pairs(backupRuleSources) do
+            -- Check if ruleSources is nil OR empty (constructionRep may set it
+            -- to {} when no inputCargoTypeForAiBuilder params exist)
+            if not ruleSources[fileName] or next(ruleSources[fileName]) == nil then
+                ruleSources[fileName] = sources
+            end
+        end
+
+        -- Build reverse map: cargoType -> {fileName, ...}
+        for fileName, outputs in pairs(industriesToOutput) do
+            for _, cargo in ipairs(outputs) do
+                if not outputsToIndustries[cargo] then
+                    outputsToIndustries[cargo] = {}
+                end
+                table.insert(outputsToIndustries[cargo], fileName)
+            end
+        end
+
+        log("SUPPLY_TREE: loaded " .. #allConstructions .. " industry types")
+
+        -- ====================================================================
+        -- Step 2: Get all live industry instances
+        -- ====================================================================
+        local industryInstances = {}   -- id -> {id, name, fileName, x, y, outputs, inputs}
+        local instancesByType = {}     -- fileName -> {instance, ...}
+        local instancesByCargo = {}    -- cargoType -> {instance, ...} (producers of that cargo)
+
+        local entities = game.interface.getEntities({radius=1e9}, {type="SIM_BUILDING", includeData=true})
+        for id, industry in pairs(entities) do
+            local constructionId = api.engine.system.streetConnectorSystem.getConstructionEntityForSimBuilding(id)
+            local construction = constructionId and constructionId > 0 and game.interface.getEntity(constructionId) or nil
+
+            local name = industry.name or (construction and construction.name) or "Industry"
+            local position = industry.position or (construction and construction.position) or {0, 0, 0}
+            local fileName = construction and construction.fileName or ""
+
+            if fileName ~= "" and string.find(fileName, "industry") then
+                local outputs = industriesToOutput[fileName] or {}
+                local inputs = ruleSources[fileName] or {}
+
+                -- Get production amount from live entity data
+                local productionAmount = "0"
+                if industry.itemsProduced then
+                    for k, v in pairs(industry.itemsProduced) do
+                        if type(k) == "string" and not k:match("^_") and type(v) == "number" and v > 0 then
+                            productionAmount = tostring(math.floor(v))
+                            break
+                        end
+                    end
+                end
+
+                local inst = {
+                    id = tostring(id),
+                    name = name,
+                    fileName = fileName,
+                    typeName = fileName:match("industry/(.-)%.") or "unknown",
+                    x = math.floor(position[1] or 0),
+                    y = math.floor(position[2] or 0),
+                    outputs = outputs,
+                    inputs = inputs,  -- {cargoType -> sourcesCount}
+                    hasOr = hasOrCondition[fileName] or false,
+                    production_amount = productionAmount
+                }
+
+                industryInstances[tostring(id)] = inst
+
+                if not instancesByType[fileName] then
+                    instancesByType[fileName] = {}
+                end
+                table.insert(instancesByType[fileName], inst)
+
+                for _, cargo in ipairs(outputs) do
+                    if not instancesByCargo[cargo] then
+                        instancesByCargo[cargo] = {}
+                    end
+                    table.insert(instancesByCargo[cargo], inst)
+                end
+            end
+        end
+
+        local instanceCount = 0
+        for _ in pairs(industryInstances) do instanceCount = instanceCount + 1 end
+        log("SUPPLY_TREE: found " .. instanceCount .. " industry instances")
+
+        -- ====================================================================
+        -- Step 3: Helper - compute distance between two points
+        -- ====================================================================
+        local function dist(x1, y1, x2, y2)
+            local dx = x1 - x2
+            local dy = y1 - y2
+            return math.floor(math.sqrt(dx * dx + dy * dy))
+        end
+
+        -- ====================================================================
+        -- Step 4: Recursive tree builder
+        -- ====================================================================
+        local function buildSupplierNode(instance, targetX, targetY, visited, depth)
+            if depth > 10 then return nil end
+
+            local visitKey = instance.id
+            if visited[visitKey] then return nil end
+            visited[visitKey] = true
+
+            local distance = dist(instance.x, instance.y, targetX, targetY)
+            local inputs = instance.inputs  -- {cargoType -> sourcesCount}
+
+            -- Check if this is a raw producer (no inputs)
+            local hasInputs = false
+            for _ in pairs(inputs) do
+                hasInputs = true
+                break
+            end
+
+            if not hasInputs then
+                -- Raw producer - leaf node
+                local node = {
+                    producer_id = instance.id,
+                    producer_name = instance.name,
+                    producer_type = instance.typeName,
+                    x = tostring(instance.x),
+                    y = tostring(instance.y),
+                    distance = tostring(distance),
+                    outputs = instance.outputs,
+                    production_amount = instance.production_amount,
+                    input_groups = {},
+                    is_raw = "true"
+                }
+                visited[visitKey] = nil  -- Allow reuse in other branches
+                return node
+            end
+
+            -- Processor - build input groups
+            local inputGroups = {}
+            local hasOr = instance.hasOr
+
+            -- Separate OR members from AND members
+            local orMembers = {}
+            local andMembers = {}
+            for cargo, sc in pairs(inputs) do
+                if hasOr and sc < 1 then
+                    table.insert(orMembers, cargo)
+                else
+                    table.insert(andMembers, cargo)
+                end
+            end
+
+            -- If hasOrCondition is set but all sourcesCount >= 1 in backup data,
+            -- we still know OR exists from constructionRep. Check if there are
+            -- multiple inputs that could be OR. In that case, fallback: treat
+            -- all non-essential inputs as OR if hasOr flag is set from constructionRep.
+            -- However, the sourcesCount from constructionRep is the authoritative source.
+            -- If sourcesCount was 0 from constructionRep, we already caught it above.
+
+            -- Build OR group if any
+            if #orMembers > 0 then
+                local orGroup = {
+                    type = "or",
+                    alternatives = orMembers,
+                    suppliers = {}
+                }
+                for _, cargo in ipairs(orMembers) do
+                    orGroup.suppliers[cargo] = {}
+                    local producers = instancesByCargo[cargo] or {}
+                    for _, producer in ipairs(producers) do
+                        if not visited[producer.id] then
+                            local subNode = buildSupplierNode(producer, instance.x, instance.y, visited, depth + 1)
+                            if subNode then
+                                table.insert(orGroup.suppliers[cargo], subNode)
+                            end
+                        end
+                    end
+                end
+                table.insert(inputGroups, orGroup)
+            end
+
+            -- Build AND groups
+            for _, cargo in ipairs(andMembers) do
+                local andGroup = {
+                    type = "and",
+                    cargo = cargo,
+                    sources_count = tostring(inputs[cargo] or 1),
+                    suppliers = {}
+                }
+                local producers = instancesByCargo[cargo] or {}
+                for _, producer in ipairs(producers) do
+                    if not visited[producer.id] then
+                        local subNode = buildSupplierNode(producer, instance.x, instance.y, visited, depth + 1)
+                        if subNode then
+                            table.insert(andGroup.suppliers, subNode)
+                        end
+                    end
+                end
+                table.insert(inputGroups, andGroup)
+            end
+
+            local node = {
+                producer_id = instance.id,
+                producer_name = instance.name,
+                producer_type = instance.typeName,
+                x = tostring(instance.x),
+                y = tostring(instance.y),
+                distance = tostring(distance),
+                outputs = instance.outputs,
+                production_amount = instance.production_amount,
+                input_groups = inputGroups,
+                is_raw = "false"
+            }
+
+            visited[visitKey] = nil  -- Allow reuse in other branches
+            return node
+        end
+
+        -- ====================================================================
+        -- Step 5: Build tree for each town
+        -- ====================================================================
+        local towns = {}
+        local allTowns = game.interface.getEntities({radius=1e9}, {type="TOWN", includeData=true})
+
+        for townId, town in pairs(allTowns) do
+            local townPos = town.position or {0, 0, 0}
+            local townX = math.floor(townPos[1] or 0)
+            local townY = math.floor(townPos[2] or 0)
+
+            -- Get town demands
+            local demands = {}
+            local demandOk, cargoSupplyAndLimit = pcall(function()
+                return game.interface.getTownCargoSupplyAndLimit(townId)
+            end)
+            if demandOk and cargoSupplyAndLimit then
+                for cargoName, supplyAndLimit in pairs(cargoSupplyAndLimit) do
+                    local supply = supplyAndLimit[1] or 0
+                    local limit = supplyAndLimit[2] or 0
+                    local demand = math.max(0, limit - supply)
+                    if demand > 0 then
+                        demands[cargoName] = tostring(demand)
+                    end
+                end
+            end
+
+            -- Build supply trees for each demanded cargo
+            local supplyTrees = {}
+            for cargoName, demandAmount in pairs(demands) do
+                local producers = instancesByCargo[cargoName] or {}
+                local trees = {}
+                for _, producer in ipairs(producers) do
+                    local visited = {}
+                    local node = buildSupplierNode(producer, townX, townY, visited, 0)
+                    if node then
+                        -- Override distance to be distance to town specifically
+                        node.distance_to_town = tostring(dist(producer.x, producer.y, townX, townY))
+                        table.insert(trees, node)
+                    end
+                end
+                -- Sort by distance to town
+                table.sort(trees, function(a, b)
+                    return tonumber(a.distance_to_town) < tonumber(b.distance_to_town)
+                end)
+                if #trees > 0 then
+                    supplyTrees[cargoName] = trees
+                end
+            end
+
+            table.insert(towns, {
+                id = tostring(townId),
+                name = town.name or "Unknown",
+                x = tostring(townX),
+                y = tostring(townY),
+                demands = demands,
+                supply_trees = supplyTrees
+            })
+        end
+
+        -- Sort towns by name
+        table.sort(towns, function(a, b) return a.name < b.name end)
+
+        log("SUPPLY_TREE: built trees for " .. #towns .. " towns")
+        return {status = "ok", data = {towns = towns}}
+    end)
+
+    if ok then return result end
+    return {status = "error", message = "query_supply_tree failed: " .. tostring(result)}
 end
 
 -- Poll for commands and process them

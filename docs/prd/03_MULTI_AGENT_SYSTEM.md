@@ -11,17 +11,20 @@ The domination system uses a multi-agent architecture where a Supervisor orchest
 
 ```
 Loop forever:
+  0. Collect performance metrics (money, lines, town supply)
   1. Query game state (year, money, speed)
-  2. Spawn SURVEYOR to analyze current state
-  3. Spawn STRATEGIST to rank opportunities
-  4. For top-priority action:
+  2. Spawn SURVEYOR to analyze current state (including chain health)
+  3. Spawn DIAGNOSTICIAN for any lines with zero transport + vehicles
+     - Diagnose root cause (wrong cargo, no supply, broken connection)
+     - Generate fix actions (reconfigure, rebuild, delete)
+  4. Spawn STRATEGIST to rank opportunities (using metrics + memory + diagnostics)
+  5. For top-priority action:
      a. Spawn PLANNER to design build sequence
      b. Spawn BUILDER to execute build sequence
      c. Spawn VERIFIER to confirm success
      d. Spawn LEARNER to record outcome
-  5. Check for problems (bankrupting lines, errors)
-     - If problems found, spawn PROBLEM_SOLVER
-  6. Wait for game to process, then repeat
+  6. Collect post-cycle metrics (measure money delta, delivery changes)
+  7. Wait for game to process, then repeat
 ```
 
 **Inputs**: Game state, agent results
@@ -37,6 +40,8 @@ Loop forever:
 - Calculate line intervals and utilization
 - Detect incomplete supply chains (intermediate legs without town delivery)
 - Check for bankrupt/negative-profit lines
+- Validate chain health: for each past successful decision, verify lines still exist with vehicles and that town supply is trending up
+- Include performance metrics summary (money rate, line health, delivery status) when available
 
 **Output**:
 ```json
@@ -67,23 +72,38 @@ Loop forever:
 ```
 
 ### 3. STRATEGIST (Decision Maker)
-**Responsibility**: Analyzes SURVEYOR output and ranks actions by priority.
+**Responsibility**: Analyzes SURVEYOR output, metrics, and past outcomes to rank actions by priority.
+
+The strategist MUST have access to performance metrics and past decision outcomes to make informed choices. A pure heuristic (scoring by distance/demand arithmetic) is insufficient — the strategist must reason about whether built chains are actually delivering cargo and generating revenue.
+
+**Decision Inputs**:
+- Surveyor report (game state, lines, DAG, problems, opportunities)
+- Performance metrics (money rate/trend, line health, delivery trends, chain health)
+- Past decisions and their outcomes (from memory store)
 
 **Decision Framework**:
 ```
-Priority 1: Fix problems (bankrupt lines, incomplete chains)
+Priority 1: Fix broken chains (built but not delivering — dead lines, no supply arriving)
 Priority 2: Complete existing partial chains to towns
-Priority 3: Build new highest-ROI supply chains
+Priority 3: Build new highest-ROI supply chains (prefer simple 2-stage first)
 Priority 4: Scale existing lines to target intervals
-Priority 5: Optimize (merge lines, adjust vehicles)
+Priority 5: Build complex chains (only when simpler ones are profitable)
 ```
 
 **Scoring Factors**:
 - **ROI**: Estimated return on investment (higher = better)
-- **Risk**: Budget impact as % of cash (lower = better, max 30%)
+- **Risk**: Budget impact as % of cash (lower = better, max 40%)
 - **Complexity**: Number of build steps (simpler = better)
 - **Memory**: What worked/failed in similar situations before
 - **Urgency**: Is money declining? Are lines losing money?
+- **Chain integrity**: Is the full supply chain complete? (raw -> processor -> town)
+- **Transport status**: NEVER scale lines with `total_transported == 0` and `vehicle_count >= 12` — these need diagnosis, not more vehicles
+
+**Line Name Matching**: When checking if a town demand is already served by existing lines, split the line name on the LAST dash (`-`). The source name is before the dash, the target name is after. Check town name ONLY in the target part to prevent false matches (e.g., line "Yangon Oil refinery-Guangzhou Fuel" should NOT match Yangon town as having FUEL served).
+
+**Chain Health Grace Period**: New chains need ~5 minutes for cargo to flow end-to-end (raw producer → truck → processor → truck → town). Do NOT flag chains as "broken" or "degraded" within 5 minutes of the decision timestamp.
+
+**LLM-Powered Strategy**: The strategist SHOULD use an LLM (via Claude CLI `--print` mode or equivalent) for reasoning when available, with a heuristic fallback. The LLM receives the full metrics dashboard, top feasible chains, chain health, and recent decision outcomes, and returns prioritized actions. This provides economic reasoning that heuristics cannot match.
 
 **Output**:
 ```json
@@ -148,11 +168,15 @@ Priority 5: Optimize (merge lines, adjust vehicles)
 
 **Planning Rules**:
 - Always build feeder legs BEFORE delivery legs
+- Always use `build_connection` with explicit `cargo` param for feeders (NOT `build_industry_connection` which auto-detects cargo and often picks wrong type)
+- Always use `build_cargo_to_town` for delivery legs (processor → town)
 - Always set load_if_available on new lines
 - Always set_line_all_terminals on new lines
 - Calculate vehicle count: `ceil(current_veh × current_interval / target_interval)`
-- Target intervals: 60s for all lines, 30s for ore/coal feeders
+- Initial build target: 120s interval (not 60s) — let chains prove profitable before scaling
+- Target intervals after proven: 60s for all lines, 30s for ore/coal feeders
 - Verify town demand BEFORE planning delivery leg
+- Check existing lines before building to avoid duplicate legs (split line name on dash for accurate matching)
 
 ### 5. BUILDER (Executor)
 **Responsibility**: Executes build sequences step-by-step via IPC.
@@ -231,12 +255,34 @@ async def verify_build(plan, build_result):
 - Cash reserves (warn if < 3 months operating costs)
 - Per-line profitability (flag lines losing money for >2 game years)
 - Vehicle ROI (flag vehicles with negative contribution)
-- Budget allocation (max 30% of cash per build action)
+- Budget allocation (max 40% of cash per build action)
 
 **Triggers**:
 - `cash < 3_months_costs` → URGENT: stop building, optimize existing
 - `line losing money > 2 years` → Recommend selling vehicles or deleting line
 - `vehicle utilization < 50%` → Recommend reducing vehicle count
+
+## Performance Metrics & Observability
+
+The system MUST track performance over time to close the feedback loop between building and profitability. Without metrics, "success" means "the build command didn't error" — not "the chain is making money."
+
+### Required Metrics
+
+| Metric | What It Measures | Why It Matters |
+|--------|-----------------|----------------|
+| Money rate ($/min) | Trend of cash over time (growing/stable/declining) | The ultimate success signal |
+| Line health | Healthy (interval<120s) vs sick (>120s) vs dead (no vehicles) | Identifies operational problems |
+| Town supply trends | Whether cargo supply at served towns is increasing | Proves deliveries are reaching destinations |
+| Broken deliveries | Built chains where town supply is flat/zero | Identifies wasted investment |
+| Chain health | Cross-references past decisions with live line/supply state | Validates end-to-end chain integrity |
+
+### Requirements
+
+1. **Metrics must be collected each cycle** — snapshot money, lines, and town supply before and after every build cycle
+2. **Town supply data must be queryable** — the IPC layer must expose per-town per-cargo supply/limit/demand values (not just net demand)
+3. **Metrics must be available to the strategist** — the strategist needs money rate, delivery health, and chain health to make informed decisions
+4. **Metrics history must persist across sessions** — store snapshots to disk so trends survive restarts
+5. **A human-readable dashboard must be printable** — operators must be able to see system health at a glance
 
 ### 8. PROBLEM_SOLVER (Firefighter)
 **Responsibility**: Diagnoses and fixes operational problems.
@@ -249,6 +295,41 @@ async def verify_build(plan, build_result):
 | Vehicles stuck | Check: station blocked? Track disconnected? | Verify track, check terminals |
 | Interval too high | Check: too few vehicles | Add vehicles to target interval |
 | Build failed | Check: game logs for error | Retry or alternative approach |
+
+### 10. DIAGNOSTICIAN (Zero-Transport Investigator)
+**Responsibility**: Investigates WHY lines have zero transport and diagnoses root causes. This is CRITICAL — without it, the system blindly scales lines that are broken (adding vehicles to lines carrying no cargo wastes $100K+ per vehicle).
+
+**When to trigger**: Any line with `total_transported == 0` AND `rate == 0` AND `vehicle_count > 0` after the grace period (5 minutes from chain creation).
+
+**Diagnostic Steps**:
+```
+1. CARGO CHECK: Query the line's vehicles — what cargo type are they configured for?
+   - Compare to what the source industry actually PRODUCES
+   - Common failure: vehicles configured for CRUDE_OIL but game cargo is CRUDE
+   - Common failure: auto-detected cargo from line name picks wrong type
+
+2. SUPPLY CHECK: Is the source industry receiving its inputs?
+   - Query industry entity for production status
+   - If processor, check that feeder lines are delivering raw materials
+   - A processor with 0 input will produce 0 output → vehicles run empty
+
+3. CONNECTION CHECK: Are stations actually connected to industry catchment?
+   - Station may be built but not within industry's catchment radius
+   - build_cargo_to_town may have silently failed (nil position error)
+   - Verify station construction entity exists
+
+4. DEMAND CHECK: Does the destination town actually demand this cargo?
+   - Re-query town_demands — demands can change over time
+   - Wrong town targeted = vehicles deliver but no revenue
+
+5. ROUTE CHECK: Can vehicles actually traverse the route?
+   - Check for road/rail breaks, demolished segments
+   - Verify pathfinding succeeds between stops
+```
+
+**Output**: Diagnosis report with root cause and recommended fix action (reconfigure cargo, rebuild connection, add feeder, delete line).
+
+**Key Insight**: The strategist MUST NOT scale lines that have zero transport. Adding more vehicles to a broken line hemorrhages cash. The diagnostician must run BEFORE any scaling decisions.
 
 ### 9. LEARNER (Memory Manager)
 **Responsibility**: Records outcomes and retrieves past experiences.
@@ -316,12 +397,14 @@ results = memory.search(
 
 | Phase | Duration | Notes |
 |-------|----------|-------|
-| Survey | 5-10s | Query game state, build DAG |
-| Strategy | 2-5s | Analyze, rank, decide |
+| Metrics | 2-5s | Collect money, lines, town supply snapshot |
+| Survey | 5-10s | Query game state, build DAG, validate chain health |
+| Strategy | 5-120s | Analyze and rank (LLM: ~30-120s, heuristic: 2-5s) |
 | Planning | 2-5s | Design build sequence |
 | Building | 15-60s per step | Wait for game processing |
 | Verification | 5-10s | Check logs, diff state |
 | Learning | 1-2s | Store outcome in memory |
+| Post-metrics | 2-5s | Measure money delta, supply changes |
 
 ### Error Handling
 

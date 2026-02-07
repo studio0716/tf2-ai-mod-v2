@@ -13,7 +13,7 @@ Transport Fever 2's economy is a directed acyclic graph (DAG) of production chai
 |----------|-------------|-------|
 | Coal mine | COAL | Common, feeds steel mills |
 | Iron ore mine | IRON_ORE | Common, feeds steel mills |
-| Oil well | CRUDE_OIL | Note: produces CRUDE_OIL, not OIL |
+| Oil well | **CRUDE** | **NOT** `CRUDE_OIL` — the game cargo type is `CRUDE` |
 | Forest | LOGS | Feeds saw mills |
 | Farm | GRAIN | Feeds food processors |
 | Quarry | STONE | Feeds construction material plants |
@@ -22,15 +22,16 @@ Transport Fever 2's economy is a directed acyclic graph (DAG) of production chai
 | Industry | Input(s) | Output | Delivers To |
 |----------|----------|--------|-------------|
 | Steel mill | IRON_ORE + COAL | STEEL | Goods/Machines/Tools factory |
-| Oil refinery | CRUDE_OIL | OIL | Chemical/Fuel refinery |
+| Oil refinery | **CRUDE** | **FUEL + PLASTIC** | Fuel to **TOWN**, Plastic to Goods factory |
 | Saw mill | LOGS | PLANKS | Tools/Machines factory |
 | Food processing plant | GRAIN | FOOD | **TOWN** |
 | Construction materials plant | STONE | CONSTRUCTION_MATERIALS | **TOWN** |
-| Chemical plant | OIL | PLASTIC | Goods factory |
-| Fuel refinery | OIL | FUEL | **TOWN** |
+| Chemical plant | PLASTIC | GOODS (with STEEL) | Goods factory |
 | Goods factory | STEEL + PLASTIC | GOODS | **TOWN** |
 | Machines factory | PLANKS + STEEL | MACHINES | **TOWN** |
 | Tools factory | PLANKS + STEEL | TOOLS | **TOWN** |
+
+**IMPORTANT**: The vanilla Oil refinery produces FUEL and PLASTIC directly from CRUDE. There is no separate "OIL" intermediate cargo in the vanilla game. The separate "Fuel refinery" and "Chemical plant" exist in the expanded mod with different recipes.
 
 ### Expanded Industry Mod (Workshop Mod 1950013035)
 
@@ -70,15 +71,16 @@ This mod adds 19 new industry types with **DIFFERENT recipes from vanilla**. The
 ### Raw Materials (From Extractors)
 These cargos are produced by raw industries with no input required:
 ```
-COAL, IRON_ORE, CRUDE_OIL, LOGS, GRAIN, STONE
+COAL, IRON_ORE, CRUDE, LOGS, GRAIN, STONE
 COFFEE_BERRIES, FISH, MARBLE, OIL_SAND, SILVER_ORE
 LIVESTOCK (special: also consumes GRAIN)
 ```
+**Note**: The game cargo type for crude oil is `CRUDE`, not `CRUDE_OIL`.
 
 ### Intermediate Goods (Between Processors)
 These cargos move between processors — they are NOT delivered to towns:
 ```
-OIL, STEEL, PLANKS, PLASTIC, SLAG
+STEEL, PLANKS, PLASTIC, SLAG
 MEAT, COFFEE, ALCOHOL, PAPER, SILVER
 ```
 
@@ -88,10 +90,11 @@ ONLY these cargos can be delivered to towns for revenue:
 FOOD, GOODS, FUEL, TOOLS, CONSTRUCTION_MATERIALS, MACHINES
 ```
 
-### CRITICAL RULE: CRUDE_OIL ≠ OIL
-- **CRUDE_OIL** comes from Oil wells → goes to Oil refinery
-- **OIL** comes from Oil refinery → goes to Chemical plant or Fuel refinery
-- These are DIFFERENT cargos! Confusing them will break supply chains.
+### CRITICAL RULE: Cargo Type Names
+- **CRUDE** (not `CRUDE_OIL`) comes from Oil wells → goes to Oil refinery
+- The vanilla Oil refinery produces **FUEL** and **PLASTIC** directly from CRUDE
+- There is no intermediate `OIL` cargo in vanilla — the expanded mod's fuel/chemical refineries use different recipes
+- The game's internal cargo type for crude oil is `CRUDE` — using `CRUDE_OIL` in IPC commands will fail silently
 
 ## Supply Chain Rules
 
@@ -107,10 +110,11 @@ Farm → [GRAIN] → Food processing plant → [FOOD] → TOWN
 Quarry → [STONE] → Construction materials plant → [CONSTR_MAT] → TOWN
 ```
 
-**FUEL chain (4 stages):**
+**FUEL chain (2 stages, vanilla):**
 ```
-Oil well → [CRUDE_OIL] → Oil refinery → [OIL] → Fuel refinery → [FUEL] → TOWN
+Oil well → [CRUDE] → Oil refinery → [FUEL] → TOWN
 ```
+Note: Vanilla oil refinery produces FUEL directly. The expanded mod has a separate fuel refinery.
 
 **TOOLS chain (3 stages):**
 ```
@@ -314,47 +318,18 @@ def score_chain(chain) -> float:
     return round(score, 1)
 ```
 
-### Mod Recipe Parsing
+### Dynamic Supply Tree (Replaces Hardcoded Recipes)
 
-The expanded mod's `.con` files contain Lua table definitions. Parse them to extract recipes:
+**IMPORTANT**: The Python-side `STANDARD_RECIPES` dict has been replaced by the `query_supply_tree` IPC handler, which builds the complete supply chain tree server-side in Lua where all game APIs are directly accessible. This is far more accurate than parsing `.con` files or hardcoding recipes, because:
 
-```python
-import re
-from pathlib import Path
+1. It uses the game's actual `constructionRep` params for OR/AND input detection
+2. It falls back to backup functions in `ai_builder_new_connections_evaluation.lua` for expanded mod industries
+3. It discovers live industry instances with real positions and production data
+4. It handles multi-output industries (e.g., Advanced Steel Mill → STEEL + SLAG)
 
-EXPANDED_MOD_DIR = Path(
-    "~/Library/Application Support/Steam/steamapps/workshop/"
-    "content/1066780/1950013035/res/construction/industry"
-).expanduser()
+See **PRD 05: Dynamic Supply Tree** for the complete format and implementation details.
 
-def parse_con_file(filepath: Path) -> dict:
-    """Parse a .con file to extract industry recipe."""
-    content = filepath.read_text()
-
-    # Extract stocks (input cargo types)
-    stocks = re.findall(r'cargoType\s*=\s*"(\w+)"', content)
-
-    # Extract rule outputs
-    outputs = re.findall(r'output\s*=\s*\{[^}]*cargoType\s*=\s*"(\w+)"', content)
-
-    # Extract rule input combinations
-    # Format: input = { {1,1,0,0}, {1,0,1,0} }
-    input_match = re.search(r'input\s*=\s*\{([^}]+)\}', content)
-    combos = []
-    if input_match and stocks:
-        for combo_match in re.finditer(r'\{([^}]+)\}', input_match.group(1)):
-            flags = [int(x.strip()) for x in combo_match.group(1).split(',')]
-            combo = [stocks[i] for i, flag in enumerate(flags) if flag == 1]
-            if combo:
-                combos.append(combo)
-
-    return {
-        'inputs': stocks if combos else [],  # Raw producers have no combos
-        'outputs': outputs,
-        'input_combos': combos or [stocks] if stocks else [],
-        'category': 'raw' if not combos and not stocks else 'processor'
-    }
-```
+The `dag_builder.py` now calls `query_supply_tree` instead of using hardcoded recipes, then formats the result for the strategist.
 
 ## Distance & Transport Mode Selection
 
@@ -382,10 +357,12 @@ trucks_needed = route_distance_m / 60 * avg_truck_speed_factor
 ### Chain Profitability Ranking
 1. **FOOD** (2-stage) — Easiest, low cost, quick ROI
 2. **CONSTRUCTION_MATERIALS** (2-stage) — Same as FOOD, easy
-3. **TOOLS** (3-stage) — Moderate complexity, good value
-4. **FUEL** (4-stage) — Long chain but high value
+3. **FUEL** (2-stage vanilla, 3-stage expanded mod) — Good value, short chain in vanilla
+4. **TOOLS** (3-stage) — Moderate complexity, good value
 5. **MACHINES** (4-stage) — Requires both PLANKS and STEEL
 6. **GOODS** (5+ stage) — Most complex, highest value but highest risk
+
+**Strategy**: Start with 2-stage chains ONLY (FOOD, CONSTRUCTION_MATERIALS, vanilla FUEL). Do NOT build GOODS/MACHINES until simple chains are profitable and money_rate is positive. Each vehicle costs ~$100K + ongoing maintenance — lean fleet until proven delivery.
 
 ### Break-Even Rules
 - 2-stage chains break even in ~3-5 game years

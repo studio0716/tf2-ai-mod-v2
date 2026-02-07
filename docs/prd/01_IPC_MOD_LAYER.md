@@ -155,6 +155,7 @@ def send_ipc(command: str, params: dict = None, timeout: float = 30.0) -> dict:
 | `resume` | — | Resumes game (speed=4) |
 | `set_speed` | `speed` (0-4) | Set game speed |
 | `add_money` | `amount` (default: 50000000) | Add money to player |
+| `set_calendar_speed` | `speed` (int) | Set date advancement rate (separate from game speed). Value = 2000/displayed_speed at 4x. 4=500x (default), 8000=0.25x, 0=pause |
 
 ### Query Commands
 
@@ -163,9 +164,10 @@ def send_ipc(command: str, params: dict = None, timeout: float = 30.0) -> dict:
 | `query_game_state` | — | Returns year, month, day, money, speed, paused |
 | `query_towns` | — | All towns with ID, name, population, position |
 | `query_town_demands` | — | **CRITICAL**: All towns with actual cargo demands |
+| `query_town_supply` | — | All towns with full cargo supply/limit/demand values (for metrics tracking) |
 | `query_town_buildings` | `town_id` | Buildings in a specific town with cargo demands |
 | `query_industries` | — | All industries with ID, name, type, position |
-| `query_lines` | — | All transport lines with vehicle_count, interval, frequency |
+| `query_lines` | — | All transport lines with vehicle_count, interval, frequency, transported cargo totals |
 | `query_vehicles` | — | All vehicles with ID and line assignment |
 | `query_stations` | — | All stations with ID and name |
 | `query_nearby_stations` | `industry_id`, `radius` (300) | Stations near an industry |
@@ -218,6 +220,7 @@ def send_ipc(command: str, params: dict = None, timeout: float = 30.0) -> dict:
 | Command | Parameters | Description |
 |---------|-----------|-------------|
 | `add_vehicle_to_line` | `line_id`, `count` (1), `cargo_type`, `wagon_type`, `num_wagons` (4), `vehicle_model` | Add vehicles to line (auto-detects road/rail) |
+| `remove_vehicles_from_line` | `line_id`, `count` | **NEW**: Sell `count` vehicles from end of line's vehicle list (keeps at least 1) |
 | `sell_vehicle` | `vehicle_id` | Sell a vehicle |
 | `reassign_vehicle` | `vehicle_id`, `line_id`, `stop_index` (0) | Reassign vehicle to different line |
 | `buy_small_train` | `line_id`, `num_wagons` (3), `cargo_type` | Buy small train for a rail line |
@@ -228,6 +231,12 @@ def send_ipc(command: str, params: dict = None, timeout: float = 30.0) -> dict:
 |---------|-----------|-------------|
 | `enable_auto_build` | `trucks`, `trains`, `buses`, `ships`, `full` | Enable AI auto-build features |
 | `disable_auto_build` | — | Disable ALL auto-build features |
+
+### Supply Chain Discovery
+
+| Command | Parameters | Description |
+|---------|-----------|-------------|
+| `query_supply_tree` | — | **NEW**: Builds complete recursive supply chain tree server-side. Returns all towns, demands, and supplier trees with OR/AND input groups, distances, and production data. See PRD 05 for format. |
 
 ### Strategic Planning
 
@@ -342,3 +351,33 @@ The game starts **PAUSED** from save. You MUST send `set_speed` command (1-4) to
 5. **The AI builder is always running**: It may auto-add vehicles to your lines. Monitor line vehicle counts.
 6. **`log()` writes to IPC log**: Use it for debugging IPC handlers
 7. **`trace()` writes to build debug log**: Used by AI builder internals
+
+## Transport Data Fields (query_lines)
+
+The `lineEntity.itemsTransported` object has these fields:
+- `_lastYear` (table) — cargo totals from last completed game year
+- `_lastMonth` (table) — cargo totals from last completed game month
+- `_sum` (number) — overall cumulative total
+- **Top-level cargo keys** (e.g., `GRAIN=102`, `FOOD=46`) — cumulative totals per cargo type
+
+**There is NO `_thisYear` field.** Using `_thisYear` will always return nil/0.
+
+In year 1 (1900), `_lastYear` is always 0 because no year has completed yet. Use top-level cumulative cargo keys as the primary transport indicator. Fall back to `_lastYear` only if no top-level keys exist.
+
+The `rate` field on a line entity indicates real-time vehicle throughput (vehicles moving per unit time). `rate > 0` means vehicles are moving but does NOT guarantee cargo is being carried — vehicles with wrong cargo config still show rate.
+
+## Cargo Type Names (Game vs Common Names)
+
+The game uses specific internal cargo names. Common mistakes:
+
+| Wrong Name | Correct Game Name | Notes |
+|-----------|------------------|-------|
+| `CRUDE_OIL` | `CRUDE` | Oil wells produce `CRUDE`, not `CRUDE_OIL` |
+| `OIL` | `CRUDE` (for raw) or `FUEL`/`PLASTIC` (for products) | Oil refineries consume `CRUDE` and produce `FUEL` + `PLASTIC` |
+| `CONSTR_MAT` | `CONSTRUCTION_MATERIALS` | Full name required |
+
+The `add_vehicle_to_line` handler matches cargo types from line names using longest-first substring matching to prevent false matches (e.g., `OIL_SAND` before `OIL`, `IRON_ORE` before `IRON`).
+
+## delete_line Behavior
+
+The `delete_line` handler automatically sells ALL vehicles on the line before deleting it. Previous behavior (keeping 1 vehicle) caused silent deletion failures.

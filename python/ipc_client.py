@@ -126,8 +126,14 @@ def query_towns() -> Dict:
 def query_town_demands() -> Dict:
     return get_ipc().send('query_town_demands')
 
+def query_town_supply() -> Dict:
+    return get_ipc().send('query_town_supply')
+
 def set_speed(speed: int) -> Dict:
     return get_ipc().send('set_speed', {'speed': speed})
+
+def set_calendar_speed(speed: float) -> Dict:
+    return get_ipc().send('set_calendar_speed', {'speed': speed})
 
 def build_industry_connection(industry1_id: int, industry2_id: int) -> Dict:
     return get_ipc().send('build_industry_connection', {

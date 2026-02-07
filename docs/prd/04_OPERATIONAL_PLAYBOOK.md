@@ -51,14 +51,15 @@ Step 3: build_cargo_to_town(tools_factory_id, town_id, "TOOLS")  # TOOLS
 Steps 4-8: Same as 2-stage (set load mode, terminals, scale vehicles)
 ```
 
-### Recipe: 4-Stage FUEL Chain
+### Recipe: FUEL Chain (Vanilla — 2 Stages)
 
 ```
-Step 1: build_industry_connection(oil_well_id, oil_refinery_id)     # CRUDE_OIL
-Step 2: build_industry_connection(oil_refinery_id, fuel_refinery_id) # OIL
-Step 3: build_cargo_to_town(fuel_refinery_id, town_id, "FUEL")      # FUEL
-Steps 4-8: Same as above
+Step 1: build_connection(oil_well_id, oil_refinery_id, cargo="CRUDE")  # CRUDE (NOT CRUDE_OIL)
+Step 2: build_cargo_to_town(oil_refinery_id, town_id, "FUEL")         # FUEL
+Steps 3-7: Same as above (load mode, terminals, scale vehicles)
 ```
+
+**Note**: Vanilla oil refinery produces FUEL directly from CRUDE. The expanded mod has a separate fuel refinery with different recipes. Always use `build_connection` with explicit `cargo` param for feeders — `build_industry_connection` auto-detects cargo and often picks the wrong type.
 
 ### Recipe: Rail Connection (For Long Distance)
 
@@ -135,7 +136,7 @@ Rail wagons ARE cargo-specific. Use the correct type:
 | Cargo Types | Wagon Type | Model Filter |
 |------------|-----------|-------------|
 | IRON_ORE, COAL, SAND, SILVER_ORE, SLAG, GRAIN, STONE | Gondola | `"gondola"` |
-| OIL, CRUDE_OIL, FUEL | Tanker | `"tank"` |
+| CRUDE, FUEL | Tanker | `"tank"` |
 | FOOD, GOODS, TOOLS, MACHINES, PLANKS, CONSTRUCTION_MATERIALS | Box car | `"box"` |
 | LOGS | Stake car / Flat car | `"stake"` or `"flat"` |
 | MARBLE | Stake car | `"stake"` |
@@ -203,6 +204,16 @@ After creating ANY new line, ALWAYS:
 
 6. **Rail track building is ASYNC.** `build_rail_track` returns `status: "pending"`. You must poll game logs to know when it finishes (typically 10-30 seconds).
 
+7. **Game cargo type is `CRUDE`, not `CRUDE_OIL`.** The `add_vehicle_to_line` handler had `CRUDE_OIL` in its cargo list which caused vehicle config failures. The correct game cargo type is `CRUDE`.
+
+8. **`build_industry_connection` auto-detects cargo — OFTEN WRONG.** Use `build_connection` with explicit `cargo` param for feeders. Line names like "Farm-FoodPlant Coal" indicate the wrong cargo type was selected.
+
+9. **`lineEntity.itemsTransported` has NO `_thisYear` field.** Use top-level cumulative cargo keys (e.g., `GRAIN=102`) or `_lastYear` as fallback. Reading `_thisYear` returns nil/0 for ALL lines.
+
+10. **`create_line_from_stations` requires `station_ids` as a JSON array**, not individual params. E.g., `{"station_ids": ["123", "456"]}`.
+
+11. **`delete_line` now sells ALL vehicles before deletion.** Previous behavior (keeping 1 vehicle) caused silent deletion failures.
+
 ### Station Gotchas
 
 7. **`newConstruction.name` does NOT set the NAME component** on the resulting entity. TF2 auto-generates station names. Use industry proximity to match stations to industries, not names.
@@ -244,12 +255,18 @@ After creating ANY new line, ALWAYS:
 | Build raw→processor without town delivery | Loses money (no revenue) | Always complete chain to town |
 | Assume town demands cargo | Delivers to town that doesn't want it | Query `query_town_demands` first |
 | Use `build_road` for specific routes | Ignores your industry IDs | Use `build_industry_connection` |
+| Use `build_industry_connection` for feeders | Auto-detects WRONG cargo type | Use `build_connection` with explicit `cargo` param |
 | Auto-detect wagon type from line name | Gets wrong cargo wagons | Pass explicit `cargo_type` |
 | Set full_load on all stops | Vehicles wait forever at empty stations | Use load_if_available |
 | Build 100+ truck lines | Expensive maintenance, diminishing returns | Use rail for routes >5km |
-| Spend >30% of cash on one build | Risk bankruptcy if it fails | Budget cap at 30% |
+| Spend >40% of cash on one build | Risk bankruptcy if it fails | Budget cap at 40% |
 | Ignore game logs after build | Miss errors and failures | Always check stdout after commands |
 | Skip terminal configuration | Vehicles queue for one platform | Set all terminals on every line |
+| Scale lines with zero transport | Adds vehicles to broken lines, hemorrhages cash | Run diagnostics first — check cargo config, supply chain, connections |
+| Use `CRUDE_OIL` as cargo type | Game uses `CRUDE` — vehicles get wrong config | Always use `CRUDE` for oil well output |
+| Substring-match town names in line names | "Yangon Oil refinery-Guangzhou" falsely matches "Yangon" town | Split line name on dash, check town ONLY in target part |
+| Scale >5 vehicles per line per pass | Cost blowouts with expensive vehicles | Cap at 5 vehicles per scaling pass, 30% cash budget |
+| Trust interval formula for new lines | New lines (1-5 vehicles) have artificially high intervals | Add max 2 vehicles conservatively for new lines |
 
 ## Session Startup Checklist
 
@@ -324,13 +341,47 @@ unserved = find_unserved_demands(dag, demands, lines)
 - Passenger revenue becomes significant
 - Large-scale network optimization
 
+## Vehicle Scaling Lessons
+
+These were learned through expensive failures:
+
+1. **New lines (1-5 vehicles) have artificially high intervals** — DON'T trust the formula, add max 2 conservatively
+2. **Vehicle costs scale with game year** — ~$100K in 1900, $600K+ in 2400s
+3. **Builder must check cash before buying vehicles** or it will bankrupt the company
+4. **Cap vehicles per scaling pass at 5 per line** (was 10, caused cost blowouts)
+5. **Initial build target: 120s interval** (not 60s) — let chains prove profitable before scaling
+6. **Vehicle budget: max 30% of cash per scaling pass**
+7. **NEVER scale lines with zero transport** — lines with `total_transported == 0` and `vehicle_count >= 12` need diagnosis, not more vehicles
+8. **`remove_vehicles_from_line` IPC handler** — sells vehicles from end of list, keeps at least 1
+
+## Chain Health Grace Period
+
+New chains need ~5 minutes for cargo to flow end-to-end: raw producer → truck → processor → truck → town. Don't flag chains as "broken" or "degraded" within 5 minutes of the decision timestamp. Applied in: `metrics._compute_delivery_trends`, `metrics._compute_chain_health`, `surveyor._validate_chain_health`.
+
+## Game Save/Restart Behavior
+
+- TF2 auto-saves ONLY at year boundaries
+- With slow calendar speed (0.25x), year 1900 lasts very long — no auto-save triggers
+- **Restarting TF2 mid-year loses ALL built lines/vehicles since the last year boundary**
+- This means 3+ game-year builds can be lost in seconds
+- Workaround: manually trigger save or accept the risk
+
+## Python Environment
+
+- Use `PYTHONUNBUFFERED=1` when running the orchestrator to see print() output in real time
+- Without it, stdout is buffered and output appears only after buffer fills or process exits
+- Example: `PYTHONUNBUFFERED=1 python orchestrator.py`
+
 ## Financial Rules of Thumb
 
 | Rule | Threshold | Action |
 |------|-----------|--------|
-| Max spend per build | 30% of cash | Don't exceed |
+| Max spend per build | 40% of cash | Don't exceed (was 30%, too restrictive on spread-out maps) |
+| Max leg distance (road) | 10km | Skip if any single leg exceeds this (was 5km) |
 | Emergency reserve | 3 months operating costs | Stop building if below |
 | Line ROI target | > 5% annual | Delete if below after 3 years |
 | Vehicle payback | < 2 game years | Don't buy if payback longer |
 | Optimal line length (road) | 1-5km | Shorter = better |
 | Optimal line length (rail) | 3-15km | Sweet spot is 5-10km |
+| Vehicle scaling cap | 5 per line per pass | Prevents cost blowouts |
+| Vehicle cash budget | 30% of cash per scaling pass | Prevents bankruptcy |
