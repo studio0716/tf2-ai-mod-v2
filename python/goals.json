@@ -1,0 +1,12 @@
+{
+  "goals": [
+    {
+      "id": "g1",
+      "description": "Build profitable supply chains to grow cash reserves",
+      "status": "active",
+      "priority": 1,
+      "progress": "",
+      "blocked_reason": null
+    }
+  ]
+}

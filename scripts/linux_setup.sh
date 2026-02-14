@@ -69,6 +69,12 @@ if [ ! -d "$REPO_DIR" ]; then
 fi
 echo "  Repo found at $REPO_DIR"
 
+# Install Python dependencies
+if [ -f "$REPO_DIR/requirements.txt" ]; then
+  echo "[2/10] Installing Python dependencies..."
+  pip3 install -r "$REPO_DIR/requirements.txt"
+fi
+
 # ------------------------------------------------------------------
 # Phase 3: Install TF2 via SteamCMD
 # ------------------------------------------------------------------
@@ -194,6 +200,24 @@ Environment=DISPLAY=:0
 WantedBy=default.target
 SVCEOF
 
+# TF2 AI Agent service (persistent agent with chat)
+cat > ~/.config/systemd/user/tf2-agent.service << AGENTEOF
+[Unit]
+Description=TF2 AI Agent Service
+After=network-online.target tf2-ai.service
+
+[Service]
+Type=simple
+WorkingDirectory=$REPO_DIR/python
+ExecStart=/usr/bin/python3 $REPO_DIR/python/agent_service.py
+Restart=always
+RestartSec=15
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=default.target
+AGENTEOF
+
 # Sunshine game streaming service
 cat > ~/.config/systemd/user/sunshine.service << 'EOF'
 [Unit]
@@ -212,7 +236,7 @@ WantedBy=default.target
 EOF
 
 systemctl --user daemon-reload
-systemctl --user enable openclaw.service tf2-ai.service sunshine.service
+systemctl --user enable openclaw.service tf2-ai.service tf2-agent.service sunshine.service
 
 # Enable lingering so user services start at boot (before login)
 loginctl enable-linger "$(whoami)"
