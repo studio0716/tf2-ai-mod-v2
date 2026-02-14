@@ -309,6 +309,7 @@ handlers.query_town_demands = function(params)
             name = town.name or "Unknown",
             x = tostring(math.floor(townPos[1] or 0)),
             y = tostring(math.floor(townPos[2] or 0)),
+            z = tostring(math.floor(townPos[3] or 0)),
             population = tostring(town.population or 0),
             building_count = tostring(#townBuildings),
             cargo_demands = cargoDemandsStr  -- ACTUAL demands: "FOOD:50, GOODS:30" or empty if none
@@ -379,12 +380,175 @@ handlers.query_industries = function(params)
                 name = name,
                 type = fileName:match("industry/(.-)%.") or "unknown",
                 x = tostring(math.floor(position[1] or 0)),
-                y = tostring(math.floor(position[2] or 0))
+                y = tostring(math.floor(position[2] or 0)),
+                z = tostring(math.floor(position[3] or 0))
             })
         end
     end
 
     return {status = "ok", data = {industries = industries}}
+end
+
+-- Debug helper: inspect one industry's live cargo IO and AI-builder params.
+handlers.query_industry_recipe = function(params)
+    if not params or not params.industry_id then
+        return {status = "error", message = "Need industry_id parameter"}
+    end
+
+    local industryId = tonumber(params.industry_id)
+    if not industryId then
+        return {status = "error", message = "Invalid industry_id"}
+    end
+
+    local industry = game.interface.getEntity(industryId)
+    if not industry then
+        return {status = "error", message = "Industry not found: " .. tostring(industryId)}
+    end
+
+    local constructionId = api.engine.system.streetConnectorSystem.getConstructionEntityForSimBuilding(industryId)
+    local construction = constructionId and constructionId > 0 and game.interface.getEntity(constructionId) or nil
+    local constructionComp = nil
+    if constructionId and constructionId > 0 then
+        local okCon, conComp = pcall(function()
+            return api.engine.getComponent(constructionId, api.type.ComponentType.CONSTRUCTION)
+        end)
+        if okCon then
+            constructionComp = conComp
+        end
+    end
+
+    local produced = {}
+    if industry.itemsProduced then
+        for cargoName, amount in pairs(industry.itemsProduced) do
+            if type(cargoName) == "string" and not cargoName:match("^_") then
+                produced[cargoName] = tostring(amount)
+            end
+        end
+    end
+
+    local consumed = {}
+    if industry.itemsConsumed then
+        for cargoName, amount in pairs(industry.itemsConsumed) do
+            if type(cargoName) == "string" and not cargoName:match("^_") then
+                consumed[cargoName] = tostring(amount)
+            end
+        end
+    end
+
+    local aiParams = {
+        inputCargoTypeForAiBuilder = {},
+        outputCargoTypeForAiBuilder = {},
+        sourcesCountForAiBuilder = {}
+    }
+    if constructionComp and constructionComp.params then
+        for _, param in pairs(constructionComp.params) do
+            if type(param) == "table" and param.key and type(param.values) == "table" then
+                if param.key == "inputCargoTypeForAiBuilder" then
+                    aiParams.inputCargoTypeForAiBuilder = param.values
+                elseif param.key == "outputCargoTypeForAiBuilder" then
+                    aiParams.outputCargoTypeForAiBuilder = param.values
+                elseif param.key == "sourcesCountForAiBuilder" then
+                    aiParams.sourcesCountForAiBuilder = param.values
+                end
+            end
+        end
+    end
+
+    return {
+        status = "ok",
+        data = {
+            industry_id = tostring(industryId),
+            name = industry.name or "Unknown",
+            file_name = construction and construction.fileName or "",
+            type = (construction and construction.fileName and construction.fileName:match("industry/(.-)%.") or "unknown"),
+            items_produced = produced,
+            items_consumed = consumed,
+            ai_params = aiParams
+        }
+    }
+end
+
+-- Debug helper: inspect constructionRep data for a specific .con file.
+handlers.query_construction_recipe = function(params)
+    if not params or not params.file_name then
+        return {status = "error", message = "Need file_name parameter"}
+    end
+    local fileName = tostring(params.file_name)
+    local idx = api.res.constructionRep.find(fileName)
+    if not idx or idx < 0 then
+        return {status = "error", message = "construction not found: " .. fileName}
+    end
+
+    local okRep, rep = pcall(function()
+        return api.res.constructionRep.get(idx)
+    end)
+    if not okRep or not rep then
+        return {status = "error", message = "failed to load constructionRep: " .. fileName}
+    end
+
+    local util = require "ai_builder_base_util"
+    local repTable = rep
+    local okClone, cloned = pcall(function()
+        return util.deepClone(rep)
+    end)
+    if okClone and cloned then
+        repTable = cloned
+    end
+
+    local function copyArray(t)
+        local out = {}
+        if type(t) == "table" then
+            for i, v in pairs(t) do
+                out[tostring(i)] = tostring(v)
+            end
+        end
+        return out
+    end
+
+    local result = {
+        file_name = fileName,
+    }
+
+    local okTags, tags = pcall(function()
+        return repTable.placementParams and repTable.placementParams.tags or nil
+    end)
+    if okTags then result.placement_tags = copyArray(tags) end
+
+    local okWeights, weights = pcall(function()
+        return repTable.placementParams and repTable.placementParams.distanceWeights or nil
+    end)
+    if okWeights then result.distance_weights = copyArray(weights) end
+
+    local okParams, paramsTable = pcall(function()
+        return repTable.params
+    end)
+    if okParams and type(paramsTable) == "table" then
+        local paramsOut = {}
+        for _, p in pairs(paramsTable) do
+            if type(p) == "table" and p.key then
+                paramsOut[p.key] = copyArray(p.values)
+            end
+        end
+        result.params = paramsOut
+    end
+
+    local okStocks, stocks = pcall(function()
+        return repTable.stockListConfig and repTable.stockListConfig.stocks or nil
+    end)
+    if okStocks then result.stockListConfig_stocks = copyArray(stocks) end
+
+    local okRule, rule = pcall(function()
+        return repTable.stockListConfig and repTable.stockListConfig.rule or nil
+    end)
+    if okRule and type(rule) == "table" then
+        result.stockListConfig_rule = {
+            input = copyArray(rule.input),
+            output = copyArray(rule.output),
+            capacity = tostring(rule.capacity)
+        }
+    end
+
+    return {status = "ok", data = result}
 end
 
 handlers.query_lines = function(params)
@@ -399,6 +563,17 @@ handlers.query_lines = function(params)
         local vehicles = api.engine.system.transportVehicleSystem.getLineVehicles(lineId)
         local lineData = util.getComponent(lineId, api.type.ComponentType.LINE)
         local lineEntity = util.getEntity(lineId)
+        local transportType = "road"
+        if lineData and lineData.vehicleInfo and lineData.vehicleInfo.transportModes then
+            local modes = lineData.vehicleInfo.transportModes
+            if modes[api.type.enum.TransportMode.TRAIN+1] and modes[api.type.enum.TransportMode.TRAIN+1] > 0 then
+                transportType = "rail"
+            elseif modes[api.type.enum.TransportMode.SHIP+1] and modes[api.type.enum.TransportMode.SHIP+1] > 0 then
+                transportType = "water"
+            elseif modes[api.type.enum.TransportMode.AIRCRAFT+1] and modes[api.type.enum.TransportMode.AIRCRAFT+1] > 0 then
+                transportType = "air"
+            end
+        end
 
         -- Get frequency/rate data
         local rate = lineEntity and lineEntity.rate or 0
@@ -449,6 +624,7 @@ handlers.query_lines = function(params)
             rate = tostring(rate),
             frequency = tostring(frequency),
             interval = tostring(math.floor(interval)),  -- seconds between vehicles
+            transport_type = transportType,
             transported = transported,  -- cargo -> amount last year
             total_transported = tostring(math.floor(totalTransported))
         })
@@ -1081,10 +1257,22 @@ handlers.build_connection = function(params)
     local transport_type = params.transport_type or "road"
     local carrier = api.type.enum.Carrier.ROAD
     local event_name = "buildNewIndustryRoadConnection"
+    local event_params = {ignoreErrors = false, preSelectedPair = {ind1_id, ind2_id}}
 
     if transport_type == "rail" then
         carrier = api.type.enum.Carrier.RAIL
         event_name = "buildIndustryRailConnection"
+        -- Default to cheap single-track rail unless explicitly overridden.
+        local forceDoubleTrack = false
+        local expensiveMode = false
+        if params.double_track ~= nil then
+            forceDoubleTrack = (params.double_track == "true" or params.double_track == true)
+        end
+        if params.expensive_mode ~= nil then
+            expensiveMode = (params.expensive_mode == "true" or params.expensive_mode == true)
+        end
+        event_params.forceDoubleTrack = forceDoubleTrack
+        event_params.expensiveMode = expensiveMode
     elseif transport_type == "water" or transport_type == "ship" then
         carrier = api.type.enum.Carrier.WATER
         event_name = "buildNewWaterConnection"
@@ -1116,13 +1304,15 @@ handlers.build_connection = function(params)
         isCargo = true
     }
 
+    event_params.result = result
+
     -- Send to AI Builder with the pre-built result
     local ok, err = pcall(function()
         api.cmd.sendCommand(api.cmd.make.sendScriptEvent(
             "ai_builder_script",
             event_name,
             "",
-            {ignoreErrors = false, result = result, preSelectedPair = {ind1_id, ind2_id}}
+            event_params
         ))
     end)
 
@@ -1240,11 +1430,32 @@ handlers.build_cargo_to_town = function(params)
     local dy = p1.y - p0.y
     local distance = math.sqrt(dx * dx + dy * dy)
 
+    -- Determine transport type
+    local transport_type = params.transport_type or "road"
+    local carrier = api.type.enum.Carrier.ROAD
+    local event_name = "buildNewIndustryRoadConnection"
+    local event_params = {ignoreErrors = false, preSelectedPair = {ind_id, town_id}}
+    if transport_type == "rail" then
+        carrier = api.type.enum.Carrier.RAIL
+        event_name = "buildIndustryRailConnection"
+        -- Default to cheap single-track rail unless explicitly overridden.
+        local forceDoubleTrack = false
+        local expensiveMode = false
+        if params.double_track ~= nil then
+            forceDoubleTrack = (params.double_track == "true" or params.double_track == true)
+        end
+        if params.expensive_mode ~= nil then
+            expensiveMode = (params.expensive_mode == "true" or params.expensive_mode == true)
+        end
+        event_params.forceDoubleTrack = forceDoubleTrack
+        event_params.expensiveMode = expensiveMode
+    end
+
     -- Build result object same as build_connection does
     local result = {
         industry1 = industry,
         industry2 = town,
-        carrier = api.type.enum.Carrier.ROAD,
+        carrier = carrier,
         cargoType = params.cargo or nil,
         p0 = p0,
         p1 = p1,
@@ -1255,13 +1466,15 @@ handlers.build_cargo_to_town = function(params)
         isCargo = true
     }
 
-    -- Send to AI Builder using the standard road connection builder
+    event_params.result = result
+
+    -- Send to AI Builder using selected carrier builder.
     local ok, err = pcall(function()
         api.cmd.sendCommand(api.cmd.make.sendScriptEvent(
             "ai_builder_script",
-            "buildNewIndustryRoadConnection",
+            event_name,
             "",
-            {ignoreErrors = false, result = result, preSelectedPair = {ind_id, town_id}}
+            event_params
         ))
     end)
 
@@ -1274,7 +1487,8 @@ handlers.build_cargo_to_town = function(params)
     return {status = "ok", data = {
         industry = industry.name,
         town = town.name,
-        cargo = params.cargo
+        cargo = params.cargo,
+        transport_type = transport_type
     }}
 end
 
@@ -3833,7 +4047,7 @@ handlers.query_supply_tree = function(params)
         end)
         if repOk and allReps then
             for _, fileName in pairs(allReps) do
-                if string.find(fileName, "industry") and not string.find(fileName, "industry/extension/") then
+                if string.find(fileName, "industry/") then
                     table.insert(allConstructions, fileName)
                     local findOk, industryRep = pcall(function()
                         return api.res.constructionRep.get(api.res.constructionRep.find(fileName))
@@ -3898,7 +4112,7 @@ handlers.query_supply_tree = function(params)
             backupOutputs["industry/farm.con"] = {"GRAIN"}
             backupOutputs["industry/steel_mill.con"] = {"STEEL"}
             backupOutputs["industry/saw_mill.con"] = {"PLANKS"}
-            backupOutputs["industry/oil_refinery.con"] = {"FUEL", "PLASTIC"}
+            backupOutputs["industry/oil_refinery.con"] = {"OIL"}
             backupOutputs["industry/chemical_plant.con"] = {"PLASTIC"}
             backupOutputs["industry/fuel_refinery.con"] = {"FUEL"}
             backupOutputs["industry/food_processing_plant.con"] = {"FOOD"}
@@ -3939,8 +4153,8 @@ handlers.query_supply_tree = function(params)
             backupRuleSources["industry/steel_mill.con"] = {["IRON_ORE"]=1, ["COAL"]=1}
             backupRuleSources["industry/saw_mill.con"] = {["LOGS"]=1}
             backupRuleSources["industry/oil_refinery.con"] = {["CRUDE"]=1}
-            backupRuleSources["industry/chemical_plant.con"] = {["CRUDE"]=1}
-            backupRuleSources["industry/fuel_refinery.con"] = {["CRUDE"]=1}
+            backupRuleSources["industry/chemical_plant.con"] = {["OIL"]=1}
+            backupRuleSources["industry/fuel_refinery.con"] = {["OIL"]=1}
             backupRuleSources["industry/food_processing_plant.con"] = {["GRAIN"]=1}
             backupRuleSources["industry/tools_factory.con"] = {["STEEL"]=1, ["PLANKS"]=1}
             backupRuleSources["industry/machines_factory.con"] = {["STEEL"]=1, ["PLASTIC"]=1}
@@ -4004,14 +4218,140 @@ handlers.query_supply_tree = function(params)
         for id, industry in pairs(entities) do
             local constructionId = api.engine.system.streetConnectorSystem.getConstructionEntityForSimBuilding(id)
             local construction = constructionId and constructionId > 0 and game.interface.getEntity(constructionId) or nil
+            local constructionComp = nil
+            if constructionId and constructionId > 0 then
+                local okCon, conComp = pcall(function()
+                    return api.engine.getComponent(constructionId, api.type.ComponentType.CONSTRUCTION)
+                end)
+                if okCon then
+                    constructionComp = conComp
+                end
+            end
 
             local name = industry.name or (construction and construction.name) or "Industry"
             local position = industry.position or (construction and construction.position) or {0, 0, 0}
             local fileName = construction and construction.fileName or ""
 
             if fileName ~= "" and string.find(fileName, "industry") then
-                local outputs = industriesToOutput[fileName] or {}
-                local inputs = ruleSources[fileName] or {}
+                -- Parse per-instance AI-builder params from this construction first.
+                local instanceInputCargos = {}
+                local instanceOutputCargos = {}
+                local instanceSourcesCount = {}
+                local inputFromInstance = false
+
+                if constructionComp and constructionComp.params then
+                    local paramInputs = {}
+                    local paramOutputs = {}
+                    local paramSources = {}
+                    for _, param in pairs(constructionComp.params) do
+                        if type(param) == "table" and param.key == "inputCargoTypeForAiBuilder" then
+                            local values = type(param.values) == "table" and param.values or {}
+                            for _, cargoType in pairs(values) do
+                                if cargoType ~= "NONE" then
+                                    table.insert(paramInputs, cargoType)
+                                end
+                            end
+                            inputFromInstance = true
+                        elseif type(param) == "table" and param.key == "outputCargoTypeForAiBuilder" then
+                            local values = type(param.values) == "table" and param.values or {}
+                            for _, cargoType in pairs(values) do
+                                if cargoType ~= "NONE" then
+                                    table.insert(paramOutputs, cargoType)
+                                end
+                            end
+                        elseif type(param) == "table" and param.key == "sourcesCountForAiBuilder" then
+                            paramSources = type(param.values) == "table" and param.values or {}
+                        end
+                    end
+
+                    instanceInputCargos = paramInputs
+                    instanceOutputCargos = paramOutputs
+                    for i, cargo in ipairs(paramInputs) do
+                        instanceSourcesCount[cargo] = tonumber(paramSources[i]) or 1
+                    end
+                end
+
+                -- Build output cargos from live entity data FIRST.
+                -- Fall back to recipe outputs only if live data is unavailable.
+                local outputs = {}
+                local outputSeen = {}
+                if industry.itemsProduced then
+                    for cargoName, _ in pairs(industry.itemsProduced) do
+                        if type(cargoName) == "string" and not cargoName:match("^_")
+                           and not outputSeen[cargoName] then
+                            outputSeen[cargoName] = true
+                            table.insert(outputs, cargoName)
+                        end
+                    end
+                end
+                if #outputs == 0 and #instanceOutputCargos > 0 then
+                    for _, cargo in ipairs(instanceOutputCargos) do
+                        if not outputSeen[cargo] then
+                            outputSeen[cargo] = true
+                            table.insert(outputs, cargo)
+                        end
+                    end
+                end
+                if #outputs == 0 then
+                    local recipeOutputs = industriesToOutput[fileName] or {}
+                    for _, cargo in ipairs(recipeOutputs) do
+                        if not outputSeen[cargo] then
+                            outputSeen[cargo] = true
+                            table.insert(outputs, cargo)
+                        end
+                    end
+                end
+
+                -- Build input cargos from ruleSources, then prefer live
+                -- consumed cargos for this specific industry instance.
+                local recipeInputs = ruleSources[fileName] or {}
+                local inputs = {}
+
+                local function getSourcesCountFor(cargoName)
+                    if instanceSourcesCount[cargoName] ~= nil then
+                        return tonumber(instanceSourcesCount[cargoName]) or 1
+                    end
+                    return tonumber(recipeInputs[cargoName]) or 1
+                end
+
+                local liveInputSeen = {}
+                local liveInputCount = 0
+                if industry.itemsConsumed then
+                    for cargoName, _ in pairs(industry.itemsConsumed) do
+                        if type(cargoName) == "string" and not cargoName:match("^_") then
+                            if not liveInputSeen[cargoName] then
+                                liveInputSeen[cargoName] = true
+                                liveInputCount = liveInputCount + 1
+                            end
+                        end
+                    end
+                end
+
+                if liveInputCount > 0 then
+                    -- Use exactly what this instance consumes in live data.
+                    for cargoName, _ in pairs(liveInputSeen) do
+                        inputs[cargoName] = getSourcesCountFor(cargoName)
+                    end
+
+                    -- Preserve OR metadata only for live inputs that are present.
+                    for cargoName, sc in pairs(recipeInputs) do
+                        local scNum = tonumber(sc) or 1
+                        if scNum < 1 and inputs[cargoName] ~= nil then
+                            inputs[cargoName] = scNum
+                        end
+                    end
+                elseif #instanceInputCargos > 0 and inputFromInstance then
+                    -- Live consumed list unavailable: use this instance's
+                    -- construction params before global recipe fallback.
+                    for _, cargoName in ipairs(instanceInputCargos) do
+                        inputs[cargoName] = getSourcesCountFor(cargoName)
+                    end
+                else
+                    -- No live consumed cargo data available; use recipe fallback.
+                    for cargoName, sc in pairs(recipeInputs) do
+                        inputs[cargoName] = tonumber(sc) or 1
+                    end
+                end
 
                 -- Get production amount from live entity data
                 local productionAmount = "0"
@@ -4024,6 +4364,15 @@ handlers.query_supply_tree = function(params)
                     end
                 end
 
+                local hasOr = hasOrCondition[fileName] or false
+                for _, sc in pairs(inputs) do
+                    local scNum = tonumber(sc) or 1
+                    if scNum < 1 then
+                        hasOr = true
+                        break
+                    end
+                end
+
                 local inst = {
                     id = tostring(id),
                     name = name,
@@ -4031,9 +4380,10 @@ handlers.query_supply_tree = function(params)
                     typeName = fileName:match("industry/(.-)%.") or "unknown",
                     x = math.floor(position[1] or 0),
                     y = math.floor(position[2] or 0),
+                    z = math.floor(position[3] or 0),
                     outputs = outputs,
                     inputs = inputs,  -- {cargoType -> sourcesCount}
-                    hasOr = hasOrCondition[fileName] or false,
+                    hasOr = hasOr,
                     production_amount = productionAmount
                 }
 
@@ -4055,6 +4405,7 @@ handlers.query_supply_tree = function(params)
 
         local instanceCount = 0
         for _ in pairs(industryInstances) do instanceCount = instanceCount + 1 end
+
         log("SUPPLY_TREE: found " .. instanceCount .. " industry instances")
 
         -- ====================================================================
@@ -4094,6 +4445,7 @@ handlers.query_supply_tree = function(params)
                     producer_type = instance.typeName,
                     x = tostring(instance.x),
                     y = tostring(instance.y),
+                    z = tostring(instance.z or 0),
                     distance = tostring(distance),
                     outputs = instance.outputs,
                     production_amount = instance.production_amount,
@@ -4174,6 +4526,7 @@ handlers.query_supply_tree = function(params)
                 producer_type = instance.typeName,
                 x = tostring(instance.x),
                 y = tostring(instance.y),
+                z = tostring(instance.z or 0),
                 distance = tostring(distance),
                 outputs = instance.outputs,
                 production_amount = instance.production_amount,
@@ -4195,18 +4548,39 @@ handlers.query_supply_tree = function(params)
             local townPos = town.position or {0, 0, 0}
             local townX = math.floor(townPos[1] or 0)
             local townY = math.floor(townPos[2] or 0)
+            local townZ = math.floor(townPos[3] or 0)
+
+            -- Get town-level building cargo demands. The supply tree should
+            -- start from what town buildings actually demand.
+            local buildingDemandCargo = {}
+            local townBuildingMap = api.engine.system.townBuildingSystem.getTown2BuildingMap()
+            local townBuildings = townBuildingMap[townId] or {}
+            for _, buildingId in pairs(townBuildings) do
+                local constructionId = api.engine.system.streetConnectorSystem.getConstructionEntityForTownBuilding(buildingId)
+                if constructionId and constructionId > 0 then
+                    local okCon, conComp = pcall(function()
+                        return api.engine.getComponent(constructionId, api.type.ComponentType.CONSTRUCTION)
+                    end)
+                    if okCon and conComp and conComp.params and conComp.params.cargoTypes then
+                        for _, cargoType in ipairs(conComp.params.cargoTypes) do
+                            buildingDemandCargo[cargoType] = true
+                        end
+                    end
+                end
+            end
 
             -- Get town demands
             local demands = {}
             local demandOk, cargoSupplyAndLimit = pcall(function()
                 return game.interface.getTownCargoSupplyAndLimit(townId)
             end)
+            local hasBuildingDemand = next(buildingDemandCargo) ~= nil
             if demandOk and cargoSupplyAndLimit then
                 for cargoName, supplyAndLimit in pairs(cargoSupplyAndLimit) do
                     local supply = supplyAndLimit[1] or 0
                     local limit = supplyAndLimit[2] or 0
                     local demand = math.max(0, limit - supply)
-                    if demand > 0 then
+                    if demand > 0 and (not hasBuildingDemand or buildingDemandCargo[cargoName]) then
                         demands[cargoName] = tostring(demand)
                     end
                 end
@@ -4240,6 +4614,7 @@ handlers.query_supply_tree = function(params)
                 name = town.name or "Unknown",
                 x = tostring(townX),
                 y = tostring(townY),
+                z = tostring(townZ),
                 demands = demands,
                 supply_trees = supplyTrees
             })
